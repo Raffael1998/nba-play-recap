@@ -1,72 +1,131 @@
 # NBA Play Recap
 
-Build short, game-level NBA video recaps from official per-play clips and play-by-play data.
+Build local NBA game recap videos from official per-play clips and live play-by-play data.
 
-## Goal
+## What It Does
 
-Given a `GameID`, fetch the play-by-play timeline, discover which events have video, rank the most important plays, and produce a compact "watch the game in 5 minutes" recap.
+Given an NBA `GameID`, the pipeline:
 
-## Why This Project
+- fetches the live play-by-play timeline,
+- resolves which events have an official clip,
+- estimates overlap between clips,
+- removes duplicate clips by comparing sampled video frames,
+- writes manifest/debug files,
+- stitches the kept clips into one chronological MP4.
 
-The NBA site already exposes short clips for many game events. The missing piece is a workflow that:
+The current goal is a robust "watch the game through official event clips" workflow, not a ranked highlight package yet.
 
-- collects the event timeline for a game,
-- resolves available clips,
-- scores which moments matter,
-- assembles them into a coherent recap.
+## Current Behavior
 
-## Initial Scope
+The clip selection pipeline currently does two main kinds of pruning:
 
-- Personal-use research project.
-- Start with one full game recap.
-- Prefer official NBA clips over scraping broadcast streams.
-- Produce a JSON recap timeline first.
-- Add video stitching only after the data pipeline is reliable.
+1. Overlap pruning
+It estimates each clip's live-game window and removes clips whose estimated coverage is fully contained by other kept clips in the same period.
 
-## Constraints
+2. Fingerprint pruning
+Within each quarter, clips that share the same exact duration are compared by frame hashes at `20%`, `50%`, and `80%` of the clip. If the sampled frames match, the later clip is treated as a duplicate and removed.
 
-- NBA clip and stats usage appears restricted to personal, non-commercial use.
-- Event clips are not guaranteed for every play.
-- The best recap is not "all scoring plays"; it needs context such as runs, lead changes, clutch possessions, blocks, turnovers, and notable star plays.
+This is meant to handle NBA cases where multiple event IDs point to the same underlying video.
 
-## Current References
+## Requirements
 
-See [docs/feasibility.md](C:/Users/rgros/Documents/python_projects/nba-play-recap/docs/feasibility.md) and [docs/plan.md](C:/Users/rgros/Documents/python_projects/nba-play-recap/docs/plan.md).
+- Python `3.10+`
+- `ffmpeg` available on `PATH`
 
-## Phase 1 CLI
+Optional:
 
-The current CLI validates the data path by:
+- editable install if you want the `nba-recap` command instead of `python .\nba_recap.py`
 
-- pulling the game timeline from the NBA live play-by-play feed,
-- probing selected event numbers against the NBA `videoeventsasset` endpoint,
-- listing the events that resolve to a clip URL.
+## Main Command
 
-```powershell
-python .\nba_recap.py candidates --game-id 0042500151
-python .\nba_recap.py candidates --game-id 0042500151 --json
-python .\nba_recap.py candidates --game-id 0042500151 --save-raw data\raw\0042500151_playbyplay.json
-python .\nba_recap.py candidates --game-id 0042500151 --max-events 120
-```
-
-To render the full chronological video from all available event clips:
+To generate the full recap video for one game:
 
 ```powershell
-python .\nba_recap.py manifest --game-id 0042500151 --output-dir outputs
-python .\nba_recap.py render-full-game --game-id 0042500151 --output-dir outputs
+python .\nba_recap.py render-full-game --game-id <GAME_ID> --output-dir outputs_<GAME_ID> --ffmpeg-binary ffmpeg
 ```
 
-That command writes:
+That single command:
 
-- `outputs\0042500151_manifest.txt`
-- `outputs\0042500151_manifest.json`
-- `outputs\0042500151_concat.txt`
-- `outputs\0042500151_full_game.mp4`
+- fetches play-by-play,
+- probes clip metadata,
+- applies overlap and duplicate pruning,
+- writes manifest/debug outputs,
+- downloads the kept clips,
+- renders the final MP4.
 
-Downloaded clip files are deleted after rendering unless you pass `--keep-clips`.
+## No-Spoiler GameID Lookup
+
+If you want the `GameID` without opening the NBA website and risking spoilers:
+
+```powershell
+python .\nba_recap.py game-id --team SAS --yesterday
+python .\nba_recap.py game-id --team SAS --date 2026-05-05
+```
+
+That command prints:
+
+- `GameID`
+- matchup tricode
+- date
+
+It does not print the score.
+
+## Output Files
+
+For `--output-dir outputs_<GAME_ID>`, the pipeline writes:
+
+- `outputs_<GAME_ID>\<GAME_ID>_manifest.txt`
+- `outputs_<GAME_ID>\<GAME_ID>_manifest.json`
+- `outputs_<GAME_ID>\debug\<GAME_ID>_debug.json`
+- `outputs_<GAME_ID>\<GAME_ID>_concat.txt`
+- `outputs_<GAME_ID>\<GAME_ID>_full_game.mp4`
+
+Temporary downloaded clips are deleted after rendering unless you pass `--keep-clips`.
+
+## Manifest-Only Mode
+
+If you want to inspect the selected clips without rendering the final video:
+
+```powershell
+python .\nba_recap.py manifest --game-id <GAME_ID> --output-dir outputs_<GAME_ID> --ffmpeg-binary ffmpeg
+```
+
+This still performs fingerprint-based duplicate detection. It just stops before building the final MP4.
+
+Current safer defaults for both commands are:
+
+- `--max-workers 1`
+- `--request-retries 3`
+- `--request-timeout-seconds 12`
+- `--retry-backoff-seconds 1.5`
+
+## Candidate Inspection
+
+To inspect raw clip-backed candidates before the full pipeline:
+
+```powershell
+python .\nba_recap.py candidates --game-id <GAME_ID>
+python .\nba_recap.py candidates --game-id <GAME_ID> --json
+python .\nba_recap.py candidates --game-id <GAME_ID> --max-events 120
+python .\nba_recap.py candidates --game-id <GAME_ID> --save-raw data\raw\<GAME_ID>_playbyplay.json
+```
+
+## Editable Install
 
 If you install the project in editable mode later, you can use:
 
 ```powershell
-python -m nba_play_recap candidates --game-id 0042500151
-nba-recap candidates --game-id 0042500151
+python -m nba_play_recap render-full-game --game-id <GAME_ID> --output-dir outputs_<GAME_ID>
+nba-recap render-full-game --game-id <GAME_ID> --output-dir outputs_<GAME_ID>
 ```
+
+## Notes
+
+- This is a personal-use local tool.
+- NBA clip and stats availability is not guaranteed.
+- Some clip URLs are fragile and may return placeholders or `403` responses depending on headers or timing.
+- The current recap is chronological, not quality-ranked yet.
+
+## References
+
+See [docs/feasibility.md](C:/Users/rgros/Documents/python_projects/nba-play-recap/docs/feasibility.md) and [docs/plan.md](C:/Users/rgros/Documents/python_projects/nba-play-recap/docs/plan.md).

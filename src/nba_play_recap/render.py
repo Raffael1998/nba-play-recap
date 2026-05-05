@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import shutil
 import subprocess
 import time
@@ -33,9 +34,6 @@ VIDEO_HEADERS = {
     "Referer": "https://www.nba.com/",
     "User-Agent": DEFAULT_HEADERS["User-Agent"],
 }
-
-
-DUPLICATE_SHOT_FOLLOWUP_PRUNE_REASON = "duplicate_shot_followup_clip"
 
 
 @dataclass(slots=True)
@@ -176,16 +174,16 @@ def write_manifests(candidates: list[CandidatePlay], output_dir: Path, game_id: 
     return manifest_txt_path, manifest_json_path
 
 
-def download_available_clips(candidates: list[CandidatePlay], clip_dir: Path) -> list[Path]:
+def download_available_clips(candidates: list[CandidatePlay], clip_dir: Path) -> dict[int, Path]:
     clip_dir.mkdir(parents=True, exist_ok=True)
-    downloaded_paths: list[Path] = []
+    downloaded_paths: dict[int, Path] = {}
     for candidate in candidates:
         if not candidate.video_available or not candidate.clip_url or not candidate.included_in_render:
             continue
         clip_path = clip_dir / f"{candidate.event_num:05d}.mp4"
         if not clip_path.exists():
             _download_file(candidate.clip_url, clip_path)
-        downloaded_paths.append(clip_path)
+        downloaded_paths[candidate.event_num] = clip_path
     return downloaded_paths
 
 
@@ -279,17 +277,24 @@ def render_full_game(
             post_buffer_seconds=prune_post_buffer_seconds,
         )
     else:
-        for candidate in candidates:
-            if candidate.video_available and candidate.clip_url:
-                candidate.included_in_render = True
-                candidate.prune_reason = None
-    manifest_txt_path, manifest_json_path = write_manifests(candidates, output_dir, game_id)
+        mark_all_available_clips_included(candidates)
     available_candidates = [candidate for candidate in candidates if candidate.video_available and candidate.clip_url]
-    rendered_candidates = [candidate for candidate in available_candidates if candidate.included_in_render]
     clip_dir = output_dir / f"{game_id}_clips"
     download_started_at = time.perf_counter()
-    clip_paths = download_available_clips(available_candidates, clip_dir)
+    clip_paths_by_event = download_available_clips(available_candidates, clip_dir)
+    apply_clip_fingerprint_pruning(
+        candidates,
+        clip_paths_by_event,
+        ffmpeg_binary=ffmpeg_binary,
+    )
     debug_stats.download_seconds = round(time.perf_counter() - download_started_at, 3)
+    manifest_txt_path, manifest_json_path = write_manifests(candidates, output_dir, game_id)
+    rendered_candidates = [candidate for candidate in available_candidates if candidate.included_in_render]
+    clip_paths = [
+        clip_paths_by_event[candidate.event_num]
+        for candidate in sorted(rendered_candidates, key=lambda candidate: (candidate.period or 0, candidate.event_num))
+        if candidate.event_num in clip_paths_by_event
+    ]
     concat_list_path = write_concat_list(clip_paths, output_dir, game_id)
 
     video_path: Path | None = None
@@ -445,8 +450,6 @@ def apply_overlap_pruning(
             candidate.included_in_render = True
             candidate.prune_reason = None
 
-    _apply_duplicate_shot_rebound_rule(candidates)
-
     available_candidates = [
         candidate
         for candidate in candidates
@@ -455,7 +458,6 @@ def apply_overlap_pruning(
         and candidate.estimated_interval_start is not None
         and candidate.estimated_interval_end is not None
         and candidate.action_type != "freethrow"
-        and candidate.prune_reason != DUPLICATE_SHOT_FOLLOWUP_PRUNE_REASON
     ]
     grouped: dict[int, list[CandidatePlay]] = {}
     for candidate in available_candidates:
@@ -500,7 +502,6 @@ def _apply_global_coverage_pruning(period_candidates: list[CandidatePlay]) -> No
         candidate
         for candidate in period_candidates
         if _candidate_interval(candidate) is not None
-        and candidate.prune_reason != DUPLICATE_SHOT_FOLLOWUP_PRUNE_REASON
     ]
     for candidate in keepers:
         candidate.included_in_render = True
@@ -523,61 +524,116 @@ def _apply_global_coverage_pruning(period_candidates: list[CandidatePlay]) -> No
             candidate.prune_reason = "covered_by_period_union"
 
 
-def _apply_duplicate_shot_rebound_rule(candidates: list[CandidatePlay]) -> None:
-    ordered_candidates = sorted(
-        candidates,
-        key=lambda candidate: (
-            candidate.period or 0,
-            candidate.event_num,
-        ),
+def mark_all_available_clips_included(candidates: list[CandidatePlay]) -> None:
+    for candidate in candidates:
+        if candidate.video_available and candidate.clip_url:
+            candidate.included_in_render = True
+            candidate.prune_reason = None
+
+
+def apply_clip_fingerprint_pruning(
+    candidates: list[CandidatePlay],
+    clip_paths_by_event: dict[int, Path],
+    ffmpeg_binary: str,
+) -> None:
+    ffmpeg_executable = resolve_ffmpeg_binary(ffmpeg_binary)
+    grouped_candidates: dict[tuple[int, int], list[CandidatePlay]] = {}
+    for candidate in candidates:
+        if not candidate.included_in_render:
+            continue
+        if candidate.period is None or candidate.clip_duration_ms is None:
+            continue
+        if candidate.event_num not in clip_paths_by_event:
+            continue
+        grouped_candidates.setdefault((candidate.period, candidate.clip_duration_ms), []).append(candidate)
+
+    signature_cache: dict[int, tuple[str, str, str]] = {}
+    for group_key in sorted(grouped_candidates):
+        period_candidates = sorted(grouped_candidates[group_key], key=lambda candidate: candidate.event_num)
+        if len(period_candidates) < 2:
+            continue
+
+        seen_signatures: set[tuple[str, str, str]] = set()
+        for candidate in period_candidates:
+            signature = signature_cache.get(candidate.event_num)
+            if signature is None:
+                signature = compute_clip_frame_signature(
+                    ffmpeg_executable,
+                    clip_paths_by_event[candidate.event_num],
+                )
+                signature_cache[candidate.event_num] = signature
+            if signature in seen_signatures:
+                candidate.included_in_render = False
+                candidate.prune_reason = "duplicate_clip_fingerprint"
+                continue
+            seen_signatures.add(signature)
+            candidate.included_in_render = True
+            if candidate.prune_reason == "duplicate_clip_fingerprint":
+                candidate.prune_reason = None
+
+
+def compute_clip_frame_signature(
+    ffmpeg_executable: str,
+    clip_path: Path,
+) -> tuple[str, str, str]:
+    duration_seconds = probe_clip_duration_seconds(ffmpeg_executable, clip_path)
+    sample_fractions = (0.2, 0.5, 0.8)
+    return tuple(
+        extract_clip_frame_hash(
+            ffmpeg_executable,
+            clip_path,
+            max(0.0, min(duration_seconds - 0.05, duration_seconds * fraction)),
+        )
+        for fraction in sample_fractions
     )
-    for index, candidate in enumerate(ordered_candidates[:-1]):
-        following = _find_next_non_missing_candidate(ordered_candidates, index)
-        if following is None:
+
+
+def probe_clip_duration_seconds(ffmpeg_executable: str, clip_path: Path) -> float:
+    command = [
+        ffmpeg_executable,
+        "-hide_banner",
+        "-i",
+        str(clip_path),
+        "-f",
+        "null",
+        "-",
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, check=True)
+    duration_prefix = "Duration: "
+    for line in result.stderr.splitlines():
+        if duration_prefix not in line:
             continue
-        if _is_duplicate_shot_followup_pair(candidate, following):
-            candidate.included_in_render = False
-            candidate.prune_reason = DUPLICATE_SHOT_FOLLOWUP_PRUNE_REASON
-            following.included_in_render = True
-            if following.prune_reason == DUPLICATE_SHOT_FOLLOWUP_PRUNE_REASON:
-                following.prune_reason = None
+        duration_text = line.split(duration_prefix, maxsplit=1)[1].split(",", maxsplit=1)[0].strip()
+        hours_text, minutes_text, seconds_text = duration_text.split(":")
+        return int(hours_text) * 3600 + int(minutes_text) * 60 + float(seconds_text)
+    raise RuntimeError(f"Could not determine clip duration for {clip_path}.")
 
 
-def _find_next_non_missing_candidate(
-    ordered_candidates: list[CandidatePlay],
-    start_index: int,
-) -> CandidatePlay | None:
-    current = ordered_candidates[start_index]
-    for following in ordered_candidates[start_index + 1:]:
-        if current.period != following.period:
-            return None
-        if following.availability_status == "missing":
-            continue
-        return following
-    return None
-
-
-def _is_duplicate_shot_followup_pair(
-    shot_candidate: CandidatePlay,
-    followup_candidate: CandidatePlay,
-) -> bool:
-    if shot_candidate.period != followup_candidate.period:
-        return False
-    if shot_candidate.action_type not in {"2pt", "3pt"}:
-        return False
-    if followup_candidate.action_type not in {"rebound", "foul"}:
-        return False
-    if not shot_candidate.description.startswith("MISS "):
-        return False
-    if not shot_candidate.video_available or not followup_candidate.video_available:
-        return False
-    if shot_candidate.clip_duration_ms is None or followup_candidate.clip_duration_ms is None:
-        return False
-    if shot_candidate.clip_duration_ms != followup_candidate.clip_duration_ms:
-        return False
-    if shot_candidate.event_num >= followup_candidate.event_num:
-        return False
-    return True
+def extract_clip_frame_hash(
+    ffmpeg_executable: str,
+    clip_path: Path,
+    timestamp_seconds: float,
+) -> str:
+    command = [
+        ffmpeg_executable,
+        "-v",
+        "error",
+        "-ss",
+        f"{timestamp_seconds:.3f}",
+        "-i",
+        str(clip_path),
+        "-frames:v",
+        "1",
+        "-vf",
+        "scale=16:16,format=gray",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "gray",
+        "-",
+    ]
+    result = subprocess.run(command, capture_output=True, check=True)
+    return hashlib.sha256(result.stdout).hexdigest()
 
 
 def _candidate_interval(candidate: CandidatePlay) -> tuple[float, float] | None:

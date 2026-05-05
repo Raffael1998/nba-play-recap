@@ -105,6 +105,15 @@ class NbaStatsClient:
         url = f"{NBA_CDN_BASE_URL}/playbyplay/playbyplay_{game_id}.json"
         return self.get_json_from_url(url, LIVE_HEADERS)
 
+    def get_scoreboard_v3(self, game_date: str) -> dict[str, Any]:
+        return self.get_json(
+            "scoreboardv3",
+            {
+                "GameDate": game_date,
+                "LeagueID": "00",
+            },
+        )
+
     def get_video_event_asset(
         self,
         game_id: str,
