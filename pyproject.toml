@@ -13,6 +13,9 @@ dependencies = []
 [project.scripts]
 nba-recap = "nba_play_recap.cli:main"
 
+[tool.uv]
+package = true
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 

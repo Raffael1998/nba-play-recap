@@ -8,8 +8,10 @@ from pathlib import Path
 
 from nba_play_recap.client import NbaStatsClient, NbaStatsError
 from nba_play_recap.playbyplay import attach_video_metadata, extract_live_candidate_actions
+from nba_play_recap.progress import ProgressReporter
 from nba_play_recap.render import (
     apply_clip_fingerprint_pruning,
+    apply_final_overlap_pruning,
     apply_overlap_pruning,
     build_game_manifest,
     cleanup_clips,
@@ -379,6 +381,7 @@ def run_render_full_game(args: argparse.Namespace) -> int:
 
 def run_manifest(args: argparse.Namespace) -> int:
     client = NbaStatsClient()
+    progress = ProgressReporter(enabled=sys.stderr.isatty())
 
     try:
         candidates, debug_stats = build_game_manifest(
@@ -390,6 +393,7 @@ def run_manifest(args: argparse.Namespace) -> int:
             request_retries=args.request_retries,
             retry_backoff_seconds=args.retry_backoff_seconds,
             request_timeout_seconds=args.request_timeout_seconds,
+            progress=progress,
         )
         if args.no_prune_overlap:
             mark_all_available_clips_included(candidates)
@@ -400,13 +404,16 @@ def run_manifest(args: argparse.Namespace) -> int:
                 post_buffer_seconds=args.prune_post_buffer_seconds,
             )
         clip_dir = args.output_dir / f"{args.game_id}_manifest_clips"
-        clip_paths_by_event = download_available_clips(candidates, clip_dir)
+        clip_paths_by_event = download_available_clips(candidates, clip_dir, progress=progress)
         try:
             apply_clip_fingerprint_pruning(
                 candidates,
                 clip_paths_by_event,
                 ffmpeg_binary=args.ffmpeg_binary,
+                progress=progress,
             )
+            if not args.no_prune_overlap:
+                apply_final_overlap_pruning(candidates)
         finally:
             cleanup_clips(clip_dir)
         manifest_txt_path, manifest_json_path = write_manifests(candidates, args.output_dir, args.game_id)

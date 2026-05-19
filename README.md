@@ -31,17 +31,28 @@ This is meant to handle NBA cases where multiple event IDs point to the same und
 
 - Python `3.10+`
 - `ffmpeg` available on `PATH`
+- `uv` installed locally
 
 Optional:
 
-- editable install if you want the `nba-recap` command instead of `python .\nba_recap.py`
+- editable install if you want the `nba-recap` command instead of `uv run python .\nba_recap.py`
+
+## Setup
+
+Install the local environment with:
+
+```powershell
+uv sync
+```
+
+Then run commands with `uv run`.
 
 ## Main Command
 
 To generate the full recap video for one game:
 
 ```powershell
-python .\nba_recap.py render-full-game --game-id <GAME_ID> --output-dir outputs_<GAME_ID> --ffmpeg-binary ffmpeg
+uv run python .\nba_recap.py render-full-game --game-id <GAME_ID> --output-dir outputs_<GAME_ID> --ffmpeg-binary ffmpeg
 ```
 
 That single command:
@@ -58,8 +69,8 @@ That single command:
 If you want the `GameID` without opening the NBA website and risking spoilers:
 
 ```powershell
-python .\nba_recap.py game-id --team SAS --yesterday
-python .\nba_recap.py game-id --team SAS --date 2026-05-05
+uv run python .\nba_recap.py game-id --team SAS --yesterday
+uv run python .\nba_recap.py game-id --team SAS --date 2026-05-05
 ```
 
 That command prints:
@@ -87,7 +98,7 @@ Temporary downloaded clips are deleted after rendering unless you pass `--keep-c
 If you want to inspect the selected clips without rendering the final video:
 
 ```powershell
-python .\nba_recap.py manifest --game-id <GAME_ID> --output-dir outputs_<GAME_ID> --ffmpeg-binary ffmpeg
+uv run python .\nba_recap.py manifest --game-id <GAME_ID> --output-dir outputs_<GAME_ID> --ffmpeg-binary ffmpeg
 ```
 
 This still performs fingerprint-based duplicate detection. It just stops before building the final MP4.
@@ -104,19 +115,19 @@ Current safer defaults for both commands are:
 To inspect raw clip-backed candidates before the full pipeline:
 
 ```powershell
-python .\nba_recap.py candidates --game-id <GAME_ID>
-python .\nba_recap.py candidates --game-id <GAME_ID> --json
-python .\nba_recap.py candidates --game-id <GAME_ID> --max-events 120
-python .\nba_recap.py candidates --game-id <GAME_ID> --save-raw data\raw\<GAME_ID>_playbyplay.json
+uv run python .\nba_recap.py candidates --game-id <GAME_ID>
+uv run python .\nba_recap.py candidates --game-id <GAME_ID> --json
+uv run python .\nba_recap.py candidates --game-id <GAME_ID> --max-events 120
+uv run python .\nba_recap.py candidates --game-id <GAME_ID> --save-raw data\raw\<GAME_ID>_playbyplay.json
 ```
 
-## Editable Install
+## Entry Points
 
-If you install the project in editable mode later, you can use:
+After `uv sync`, you can use:
 
 ```powershell
-python -m nba_play_recap render-full-game --game-id <GAME_ID> --output-dir outputs_<GAME_ID>
-nba-recap render-full-game --game-id <GAME_ID> --output-dir outputs_<GAME_ID>
+uv run python -m nba_play_recap render-full-game --game-id <GAME_ID> --output-dir outputs_<GAME_ID>
+uv run nba-recap render-full-game --game-id <GAME_ID> --output-dir outputs_<GAME_ID>
 ```
 
 ## Notes

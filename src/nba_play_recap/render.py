@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import shutil
 import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ from urllib.request import Request, urlopen
 
 from nba_play_recap.client import DEFAULT_HEADERS, NbaStatsClient, NbaStatsError
 from nba_play_recap.playbyplay import CandidatePlay, attach_video_metadata, extract_live_candidate_actions
+from nba_play_recap.progress import ProgressReporter
 
 DEFAULT_PLAY_ACTION_TYPES = {
     "2pt",
@@ -74,6 +76,7 @@ def build_game_manifest(
     request_retries: int = 3,
     retry_backoff_seconds: float = 1.5,
     request_timeout_seconds: int = 10,
+    progress: ProgressReporter | None = None,
 ) -> tuple[list[CandidatePlay], FetchDebugStats]:
     debug_stats = FetchDebugStats()
     probe_started_at = time.perf_counter()
@@ -95,6 +98,9 @@ def build_game_manifest(
         else:
             debug_stats.cache_misses += 1
             unresolved_candidates.append(candidate)
+
+    if progress is not None:
+        progress.start_phase("Probing clip metadata", total=len(unresolved_candidates))
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_candidate = {
@@ -133,6 +139,10 @@ def build_game_manifest(
                 debug_stats.fetch_successes += 1
             else:
                 debug_stats.fetch_missing += 1
+            if progress is not None:
+                progress.advance()
+    if progress is not None:
+        progress.complete_phase("Clip metadata probe")
     debug_stats.video_probe_seconds = round(time.perf_counter() - probe_started_at, 3)
     return candidates, debug_stats
 
@@ -174,9 +184,20 @@ def write_manifests(candidates: list[CandidatePlay], output_dir: Path, game_id: 
     return manifest_txt_path, manifest_json_path
 
 
-def download_available_clips(candidates: list[CandidatePlay], clip_dir: Path) -> dict[int, Path]:
+def download_available_clips(
+    candidates: list[CandidatePlay],
+    clip_dir: Path,
+    progress: ProgressReporter | None = None,
+) -> dict[int, Path]:
     clip_dir.mkdir(parents=True, exist_ok=True)
     downloaded_paths: dict[int, Path] = {}
+    clips_to_download = [
+        candidate
+        for candidate in candidates
+        if candidate.video_available and candidate.clip_url and candidate.included_in_render
+    ]
+    if progress is not None:
+        progress.start_phase("Downloading clips", total=len(clips_to_download))
     for candidate in candidates:
         if not candidate.video_available or not candidate.clip_url or not candidate.included_in_render:
             continue
@@ -184,6 +205,10 @@ def download_available_clips(candidates: list[CandidatePlay], clip_dir: Path) ->
         if not clip_path.exists():
             _download_file(candidate.clip_url, clip_path)
         downloaded_paths[candidate.event_num] = clip_path
+        if progress is not None:
+            progress.advance()
+    if progress is not None:
+        progress.complete_phase("Clip download")
     return downloaded_paths
 
 
@@ -194,13 +219,24 @@ def write_concat_list(clip_paths: list[Path], output_dir: Path, game_id: str) ->
     return concat_list_path
 
 
-def render_concat_video(concat_list_path: Path, output_path: Path, ffmpeg_binary: str = "ffmpeg") -> None:
+def render_concat_video(
+    concat_list_path: Path,
+    output_path: Path,
+    ffmpeg_binary: str = "ffmpeg",
+    total_duration_seconds: float | None = None,
+    progress: ProgressReporter | None = None,
+) -> None:
     ffmpeg_executable = resolve_ffmpeg_binary(ffmpeg_binary)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     command = [
         ffmpeg_executable,
         "-y",
+        "-loglevel",
+        "error",
+        "-nostats",
+        "-progress",
+        "pipe:1",
         "-f",
         "concat",
         "-safe",
@@ -211,13 +247,22 @@ def render_concat_video(concat_list_path: Path, output_path: Path, ffmpeg_binary
         "copy",
         str(output_path),
     ]
-    result = subprocess.run(command, capture_output=True, text=True)
+    result = _run_ffmpeg_with_progress(
+        command,
+        total_duration_seconds=total_duration_seconds,
+        progress=progress,
+    )
     if result.returncode == 0:
         return
 
     fallback_command = [
         ffmpeg_executable,
         "-y",
+        "-loglevel",
+        "error",
+        "-nostats",
+        "-progress",
+        "pipe:1",
         "-f",
         "concat",
         "-safe",
@@ -230,7 +275,13 @@ def render_concat_video(concat_list_path: Path, output_path: Path, ffmpeg_binary
         "aac",
         str(output_path),
     ]
-    fallback = subprocess.run(fallback_command, capture_output=True, text=True)
+    if progress is not None:
+        progress.info("Concat copy failed, retrying with re-encode.")
+    fallback = _run_ffmpeg_with_progress(
+        fallback_command,
+        total_duration_seconds=total_duration_seconds,
+        progress=progress,
+    )
     if fallback.returncode != 0:
         raise RuntimeError(
             "ffmpeg failed to render the final video.\n"
@@ -259,6 +310,8 @@ def render_full_game(
     prune_post_buffer_seconds: float,
 ) -> RenderOutputs:
     started_at = time.perf_counter()
+    progress = ProgressReporter(enabled=sys.stderr.isatty())
+    progress.info(f"Preparing render for game {game_id}")
     ensure_ffmpeg_available(ffmpeg_binary)
     candidates, debug_stats = build_game_manifest(
         client,
@@ -269,6 +322,7 @@ def render_full_game(
         request_retries=request_retries,
         retry_backoff_seconds=retry_backoff_seconds,
         request_timeout_seconds=request_timeout_seconds,
+        progress=progress,
     )
     if prune_overlap:
         apply_overlap_pruning(
@@ -281,18 +335,21 @@ def render_full_game(
     available_candidates = [candidate for candidate in candidates if candidate.video_available and candidate.clip_url]
     clip_dir = output_dir / f"{game_id}_clips"
     download_started_at = time.perf_counter()
-    clip_paths_by_event = download_available_clips(available_candidates, clip_dir)
+    clip_paths_by_event = download_available_clips(available_candidates, clip_dir, progress=progress)
     apply_clip_fingerprint_pruning(
         candidates,
         clip_paths_by_event,
         ffmpeg_binary=ffmpeg_binary,
+        progress=progress,
     )
+    if prune_overlap:
+        apply_final_overlap_pruning(candidates)
     debug_stats.download_seconds = round(time.perf_counter() - download_started_at, 3)
     manifest_txt_path, manifest_json_path = write_manifests(candidates, output_dir, game_id)
     rendered_candidates = [candidate for candidate in available_candidates if candidate.included_in_render]
     clip_paths = [
         clip_paths_by_event[candidate.event_num]
-        for candidate in sorted(rendered_candidates, key=lambda candidate: (candidate.period or 0, candidate.event_num))
+        for candidate in sorted(rendered_candidates, key=_candidate_chronology_key)
         if candidate.event_num in clip_paths_by_event
     ]
     concat_list_path = write_concat_list(clip_paths, output_dir, game_id)
@@ -301,7 +358,19 @@ def render_full_game(
     if clip_paths:
         video_path = output_dir / f"{game_id}_full_game.mp4"
         render_started_at = time.perf_counter()
-        render_concat_video(concat_list_path, video_path, ffmpeg_binary=ffmpeg_binary)
+        total_duration_seconds = sum(
+            candidate.clip_duration_seconds or 0.0
+            for candidate in rendered_candidates
+        )
+        progress.start_phase("Rendering final video", total=max(int(round(total_duration_seconds)), 1))
+        render_concat_video(
+            concat_list_path,
+            video_path,
+            ffmpeg_binary=ffmpeg_binary,
+            total_duration_seconds=total_duration_seconds,
+            progress=progress,
+        )
+        progress.complete_phase("Final video render")
         debug_stats.render_seconds = round(time.perf_counter() - render_started_at, 3)
 
     if not keep_clips:
@@ -358,6 +427,43 @@ def _download_file(url: str, destination: Path) -> None:
             destination.write_bytes(response.read())
     except (HTTPError, URLError) as exc:
         raise RuntimeError(f"Failed to download clip: {url}") from exc
+
+
+def _run_ffmpeg_with_progress(
+    command: list[str],
+    total_duration_seconds: float | None,
+    progress: ProgressReporter | None,
+) -> subprocess.CompletedProcess[str]:
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    stdout_lines: list[str] = []
+    assert process.stdout is not None
+    for raw_line in process.stdout:
+        line = raw_line.strip()
+        stdout_lines.append(raw_line)
+        if progress is None or total_duration_seconds is None or total_duration_seconds <= 0:
+            continue
+        if not line.startswith("out_time_ms="):
+            continue
+        try:
+            out_time_seconds = int(line.split("=", maxsplit=1)[1]) / 1_000_000
+        except ValueError:
+            continue
+        estimated_seconds = min(out_time_seconds, total_duration_seconds)
+        progress.update(current=int(round(estimated_seconds)), total=max(int(round(total_duration_seconds)), 1))
+
+    return_code = process.wait()
+    combined_output = "".join(stdout_lines)
+    return subprocess.CompletedProcess(
+        args=command,
+        returncode=return_code,
+        stdout=combined_output,
+        stderr=combined_output,
+    )
 
 
 def _json_dump(candidates: list[CandidatePlay]) -> str:
@@ -450,31 +556,39 @@ def apply_overlap_pruning(
             candidate.included_in_render = True
             candidate.prune_reason = None
 
-    available_candidates = [
-        candidate
-        for candidate in candidates
-        if candidate.video_available
-        and candidate.clip_url
-        and candidate.estimated_interval_start is not None
-        and candidate.estimated_interval_end is not None
-        and candidate.action_type != "freethrow"
-    ]
-    grouped: dict[int, list[CandidatePlay]] = {}
-    for candidate in available_candidates:
-        if candidate.period is None:
+    for candidate in candidates:
+        if candidate.video_available and candidate.clip_url and candidate.estimated_interval_start is None:
             candidate.included_in_render = True
+            candidate.prune_reason = None
+        if candidate.action_type == "freethrow" and candidate.video_available and candidate.clip_url:
+            candidate.included_in_render = True
+            candidate.prune_reason = None
+        if (
+            candidate.video_available
+            and candidate.clip_url
+            and candidate.estimated_interval_start is not None
+            and candidate.estimated_interval_end is not None
+            and candidate.action_type != "freethrow"
+        ):
+            candidate.included_in_render = True
+            candidate.prune_reason = None
+
+
+def apply_final_overlap_pruning(candidates: list[CandidatePlay]) -> None:
+    grouped: dict[int, list[CandidatePlay]] = {}
+    for candidate in candidates:
+        if not candidate.included_in_render:
+            continue
+        if candidate.action_type == "freethrow":
+            continue
+        if candidate.estimated_interval_start is None or candidate.estimated_interval_end is None:
+            continue
+        if candidate.period is None:
             continue
         grouped.setdefault(candidate.period, []).append(candidate)
 
     for period_candidates in grouped.values():
         _apply_global_coverage_pruning(period_candidates)
-
-    for candidate in candidates:
-        if candidate.video_available and candidate.clip_url and candidate.estimated_interval_start is None:
-            candidate.included_in_render = True
-        if candidate.action_type == "freethrow" and candidate.video_available and candidate.clip_url:
-            candidate.included_in_render = True
-            candidate.prune_reason = None
 
 
 def estimate_live_interval(
@@ -535,6 +649,7 @@ def apply_clip_fingerprint_pruning(
     candidates: list[CandidatePlay],
     clip_paths_by_event: dict[int, Path],
     ffmpeg_binary: str,
+    progress: ProgressReporter | None = None,
 ) -> None:
     ffmpeg_executable = resolve_ffmpeg_binary(ffmpeg_binary)
     grouped_candidates: dict[tuple[int, int], list[CandidatePlay]] = {}
@@ -548,8 +663,15 @@ def apply_clip_fingerprint_pruning(
         grouped_candidates.setdefault((candidate.period, candidate.clip_duration_ms), []).append(candidate)
 
     signature_cache: dict[int, tuple[str, str, str]] = {}
+    fingerprint_candidates = sum(
+        len(period_candidates)
+        for period_candidates in grouped_candidates.values()
+        if len(period_candidates) >= 2
+    )
+    if progress is not None and fingerprint_candidates > 0:
+        progress.start_phase("Fingerprinting clips", total=fingerprint_candidates)
     for group_key in sorted(grouped_candidates):
-        period_candidates = sorted(grouped_candidates[group_key], key=lambda candidate: candidate.event_num)
+        period_candidates = sorted(grouped_candidates[group_key], key=_candidate_chronology_key)
         if len(period_candidates) < 2:
             continue
 
@@ -562,6 +684,8 @@ def apply_clip_fingerprint_pruning(
                     clip_paths_by_event[candidate.event_num],
                 )
                 signature_cache[candidate.event_num] = signature
+            if progress is not None:
+                progress.advance()
             if signature in seen_signatures:
                 candidate.included_in_render = False
                 candidate.prune_reason = "duplicate_clip_fingerprint"
@@ -570,6 +694,8 @@ def apply_clip_fingerprint_pruning(
             candidate.included_in_render = True
             if candidate.prune_reason == "duplicate_clip_fingerprint":
                 candidate.prune_reason = None
+    if progress is not None and fingerprint_candidates > 0:
+        progress.complete_phase("Clip fingerprinting")
 
 
 def compute_clip_frame_signature(
@@ -634,6 +760,16 @@ def extract_clip_frame_hash(
     ]
     result = subprocess.run(command, capture_output=True, check=True)
     return hashlib.sha256(result.stdout).hexdigest()
+
+
+def _candidate_chronology_key(candidate: CandidatePlay) -> tuple[float, float, int]:
+    period = float(candidate.period) if candidate.period is not None else float("inf")
+    clock_sort = (
+        -float(candidate.clock_seconds_remaining)
+        if candidate.clock_seconds_remaining is not None
+        else float("inf")
+    )
+    return (period, clock_sort, candidate.event_num)
 
 
 def _candidate_interval(candidate: CandidatePlay) -> tuple[float, float] | None:
