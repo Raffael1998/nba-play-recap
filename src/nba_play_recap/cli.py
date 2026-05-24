@@ -79,6 +79,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="Keep downloaded clip files after the final video is rendered.",
     )
     render.add_argument(
+        "--video-session-script",
+        type=Path,
+        help=(
+            "Fallback PowerShell script copied from browser DevTools for a working NBA video request. "
+            "By default a fresh session is acquired automatically through Chromium."
+        ),
+    )
+    render.add_argument(
+        "--no-auto-video-session",
+        action="store_true",
+        help="Disable automatic Chromium session acquisition and rely on --video-session-script or direct requests.",
+    )
+    render.add_argument(
+        "--headless-session-browser",
+        action="store_true",
+        help=(
+            "Run session acquisition in headless mode. NBA currently rejects this mode in testing; "
+            "use only to re-test compatibility in another environment."
+        ),
+    )
+    render.add_argument(
+        "--video-session-timeout-seconds",
+        type=int,
+        default=45,
+        help="Maximum time to wait for Chromium to capture a valid NBA video request.",
+    )
+    render.add_argument(
+        "--video-browser-channel",
+        default="chrome",
+        help="Playwright browser channel used for automatic session acquisition (default: chrome).",
+    )
+    render.add_argument(
         "--max-workers",
         type=int,
         default=1,
@@ -361,6 +393,11 @@ def run_render_full_game(args: argparse.Namespace) -> int:
             prune_overlap=not args.no_prune_overlap,
             prune_pre_buffer_seconds=args.prune_pre_buffer_seconds,
             prune_post_buffer_seconds=args.prune_post_buffer_seconds,
+            video_session_script=args.video_session_script,
+            auto_video_session=not args.no_auto_video_session,
+            show_session_browser=not args.headless_session_browser,
+            video_session_timeout_seconds=args.video_session_timeout_seconds,
+            video_browser_channel=args.video_browser_channel,
         )
     except (NbaStatsError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)

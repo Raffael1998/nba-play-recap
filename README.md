@@ -32,6 +32,7 @@ This is meant to handle NBA cases where multiple event IDs point to the same und
 - Python `3.10+`
 - `ffmpeg` available on `PATH`
 - `uv` installed locally
+- Google Chrome installed locally for automatic NBA video-session acquisition
 
 Optional:
 
@@ -52,17 +53,53 @@ Then run commands with `uv run`.
 To generate the full recap video for one game:
 
 ```powershell
-uv run python .\nba_recap.py render-full-game --game-id <GAME_ID> --output-dir outputs_<GAME_ID> --ffmpeg-binary ffmpeg
+uv run python .\nba_recap.py render-full-game `
+  --game-id <GAME_ID> `
+  --output-dir outputs_<GAME_ID>
 ```
 
 That single command:
 
 - fetches play-by-play,
 - probes clip metadata,
+- opens Chrome briefly on the first event page to obtain a fresh NBA video session,
+- stops immediately if NBA returns a `Video not available` placeholder,
 - applies overlap and duplicate pruning,
 - writes manifest/debug outputs,
 - downloads the kept clips,
 - renders the final MP4.
+
+The browser is opened directly on an event-video page rather than a score page. NBA currently rejects tested headless-browser requests, so the working default uses a visible Chrome window and closes it as soon as the video request is captured.
+
+If Chrome is unavailable, pass another installed Chromium browser channel, for example:
+
+```powershell
+uv run python .\nba_recap.py render-full-game `
+  --game-id <GAME_ID> `
+  --output-dir outputs_<GAME_ID> `
+  --video-browser-channel msedge
+```
+
+## Manual Session Fallback
+
+If automatic session capture stops working:
+
+1. Open one spoiler-safe play video on `nba.com/stats/events`.
+2. In Chrome DevTools Network, select its `.mp4` request.
+3. Use `Copy > Copy as PowerShell`.
+4. Save it locally as `debug_clip_download.ps1`.
+
+Then run:
+
+```powershell
+uv run python .\nba_recap.py render-full-game `
+  --game-id <GAME_ID> `
+  --output-dir outputs_<GAME_ID> `
+  --no-auto-video-session `
+  --video-session-script .\debug_clip_download.ps1
+```
+
+Do not commit `debug_clip_download.ps1`; it contains temporary browser cookies and is ignored by Git.
 
 ## No-Spoiler GameID Lookup
 
@@ -110,6 +147,20 @@ Current safer defaults for both commands are:
 - `--request-timeout-seconds 12`
 - `--retry-backoff-seconds 1.5`
 
+## Scheduled VM Execution
+
+The automated session refresh needs a browser that behaves as headed Chrome. In current testing, NBA rejects Chrome/Chromium in true headless mode.
+
+For a Linux VM, run the scheduled job under a virtual display such as `xvfb`, keeping Chrome in headed mode from the site's point of view:
+
+```bash
+xvfb-run -a uv run python ./nba_recap.py render-full-game \
+  --game-id <GAME_ID> \
+  --output-dir outputs_<GAME_ID>
+```
+
+For a Windows VM, schedule the command in an interactive desktop session with Chrome installed. A fully non-interactive Windows scheduled task is not yet validated.
+
 ## Candidate Inspection
 
 To inspect raw clip-backed candidates before the full pipeline:
@@ -135,6 +186,7 @@ uv run nba-recap render-full-game --game-id <GAME_ID> --output-dir outputs_<GAME
 - This is a personal-use local tool.
 - NBA clip and stats availability is not guaranteed.
 - Some clip URLs are fragile and may return placeholders or `403` responses depending on headers or timing.
+- Automatic session refresh has been verified with visible Google Chrome; true headless mode is currently not reliable against NBA.
 - The current recap is chronological, not quality-ranked yet.
 
 ## References

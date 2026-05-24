@@ -8,7 +8,9 @@ version = "0.1.0"
 description = "Build short NBA recaps from play-by-play data and official event clips."
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "playwright>=1.60.0",
+]
 
 [project.scripts]
 nba-recap = "nba_play_recap.cli:main"
