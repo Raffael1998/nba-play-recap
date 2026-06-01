@@ -118,6 +118,36 @@ That command prints:
 
 It does not print the score.
 
+## Nightly Batch Rendering
+
+To render every completed NBA game from the previous NBA night:
+
+```powershell
+uv run python .\nba_recap.py render-night
+```
+
+By default, `render-night` uses yesterday's date in `America/New_York`, which is the intended behavior for a morning run in France.
+
+To inspect what would run without rendering:
+
+```powershell
+uv run python .\nba_recap.py render-night --dry-run
+```
+
+To render a specific NBA scoreboard date:
+
+```powershell
+uv run python .\nba_recap.py render-night --date 2026-05-05 --output-root outputs\nightly
+```
+
+Nightly outputs are written under:
+
+- `outputs\nightly\<YYYY-MM-DD>\run_report.json`
+- `outputs\nightly\<YYYY-MM-DD>\<GAME_ID>\<GAME_ID>_full_game.mp4`
+- `outputs\nightly\<YYYY-MM-DD>\<GAME_ID>\game_status.json`
+
+Existing successful game outputs are skipped unless you pass `--force`. Dated nightly output folders older than 14 days are deleted after each non-dry-run batch; override this with `--retention-days`.
+
 ## Output Files
 
 For `--output-dir outputs_<GAME_ID>`, the pipeline writes:
@@ -160,6 +190,8 @@ xvfb-run -a uv run python ./nba_recap.py render-full-game \
 ```
 
 For a Windows VM, schedule the command in an interactive desktop session with Chrome installed. A fully non-interactive Windows scheduled task is not yet validated.
+
+See [docs/deployment.md](docs/deployment.md) for cloud VM options and a `systemd` timer setup.
 
 ## Candidate Inspection
 

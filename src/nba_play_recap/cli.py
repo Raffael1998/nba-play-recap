@@ -6,6 +6,14 @@ import sys
 from datetime import date, timedelta
 from pathlib import Path
 
+from nba_play_recap.batch import (
+    DEFAULT_OUTPUT_ROOT,
+    DEFAULT_RETENTION_DAYS,
+    RenderNightOptions,
+    has_failures,
+    render_night,
+    resolve_nba_scoreboard_date,
+)
 from nba_play_recap.client import NbaStatsClient, NbaStatsError
 from nba_play_recap.playbyplay import attach_video_metadata, extract_live_candidate_actions
 from nba_play_recap.progress import ProgressReporter
@@ -157,6 +165,123 @@ def build_parser() -> argparse.ArgumentParser:
         help="Assumed replay or setup time at the end of a clip when estimating unique live coverage.",
     )
 
+    render_night_parser = subparsers.add_parser(
+        "render-night",
+        help="Render every completed NBA game from one scoreboard date.",
+    )
+    render_night_parser.add_argument(
+        "--date",
+        dest="target_date",
+        help=(
+            "NBA scoreboard date in YYYY-MM-DD. Defaults to yesterday in America/New_York, "
+            "which matches a morning Europe/Paris scheduled run."
+        ),
+    )
+    render_night_parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=DEFAULT_OUTPUT_ROOT,
+        help="Root directory for nightly outputs.",
+    )
+    render_night_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-render games even when a prior successful output exists.",
+    )
+    render_night_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Fetch the scoreboard and report what would be rendered without writing outputs.",
+    )
+    render_night_parser.add_argument(
+        "--retention-days",
+        type=int,
+        default=DEFAULT_RETENTION_DAYS,
+        help="Delete nightly output folders older than this many days after a successful batch run.",
+    )
+    render_night_parser.add_argument(
+        "--ffmpeg-binary",
+        default="ffmpeg",
+        help="ffmpeg executable name or full path.",
+    )
+    render_night_parser.add_argument(
+        "--keep-clips",
+        action="store_true",
+        help="Keep downloaded clip files after each final video is rendered.",
+    )
+    render_night_parser.add_argument(
+        "--video-session-script",
+        type=Path,
+        help="Fallback PowerShell script copied from browser DevTools for a working NBA video request.",
+    )
+    render_night_parser.add_argument(
+        "--no-auto-video-session",
+        action="store_true",
+        help="Disable automatic Chromium session acquisition and rely on --video-session-script or direct requests.",
+    )
+    render_night_parser.add_argument(
+        "--headless-session-browser",
+        action="store_true",
+        help="Run session acquisition in headless mode. Not recommended for scheduled VM use.",
+    )
+    render_night_parser.add_argument(
+        "--video-session-timeout-seconds",
+        type=int,
+        default=45,
+        help="Maximum time to wait for Chromium to capture a valid NBA video request.",
+    )
+    render_night_parser.add_argument(
+        "--video-browser-channel",
+        default="chrome",
+        help="Playwright browser channel used for automatic session acquisition.",
+    )
+    render_night_parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=1,
+        help="Maximum concurrent clip metadata requests per game.",
+    )
+    render_night_parser.add_argument(
+        "--max-events",
+        type=int,
+        help="Optional limit for play events per game, mainly for testing.",
+    )
+    render_night_parser.add_argument(
+        "--request-retries",
+        type=int,
+        default=3,
+        help="Maximum retries for each clip metadata request.",
+    )
+    render_night_parser.add_argument(
+        "--retry-backoff-seconds",
+        type=float,
+        default=1.5,
+        help="Base backoff delay between clip metadata retries.",
+    )
+    render_night_parser.add_argument(
+        "--request-timeout-seconds",
+        type=int,
+        default=12,
+        help="Timeout for each clip metadata request.",
+    )
+    render_night_parser.add_argument(
+        "--no-prune-overlap",
+        action="store_true",
+        help="Keep all available clips even if their estimated live windows overlap heavily.",
+    )
+    render_night_parser.add_argument(
+        "--prune-pre-buffer-seconds",
+        type=float,
+        default=2.0,
+        help="Assumed replay or setup time at the start of a clip.",
+    )
+    render_night_parser.add_argument(
+        "--prune-post-buffer-seconds",
+        type=float,
+        default=2.0,
+        help="Assumed replay or setup time at the end of a clip.",
+    )
+
     manifest = subparsers.add_parser(
         "manifest",
         help="Write per-play manifest files with clip availability and fingerprint-based de-duplication, without rendering the final video.",
@@ -253,6 +378,8 @@ def main() -> int:
         return run_manifest(args)
     if args.command == "render-full-game":
         return run_render_full_game(args)
+    if args.command == "render-night":
+        return run_render_night(args)
     if args.command == "game-id":
         return run_game_id_lookup(args)
 
@@ -414,6 +541,61 @@ def run_render_full_game(args: argparse.Namespace) -> int:
     print(f"Downloaded clips: {outputs.downloaded_clip_count}")
     print(f"Final video: {outputs.video_path if outputs.video_path else 'not created'}")
     return 0
+
+
+def run_render_night(args: argparse.Namespace) -> int:
+    client = NbaStatsClient()
+    try:
+        if args.retention_days < 1:
+            raise ValueError("--retention-days must be at least 1.")
+        target_date = resolve_nba_scoreboard_date(args.target_date)
+        options = RenderNightOptions(
+            target_date=target_date,
+            output_root=args.output_root,
+            force=args.force,
+            dry_run=args.dry_run,
+            ffmpeg_binary=args.ffmpeg_binary,
+            keep_clips=args.keep_clips,
+            max_workers=args.max_workers,
+            max_events=args.max_events,
+            request_retries=args.request_retries,
+            retry_backoff_seconds=args.retry_backoff_seconds,
+            request_timeout_seconds=args.request_timeout_seconds,
+            prune_overlap=not args.no_prune_overlap,
+            prune_pre_buffer_seconds=args.prune_pre_buffer_seconds,
+            prune_post_buffer_seconds=args.prune_post_buffer_seconds,
+            video_session_script=args.video_session_script,
+            auto_video_session=not args.no_auto_video_session,
+            show_session_browser=not args.headless_session_browser,
+            video_session_timeout_seconds=args.video_session_timeout_seconds,
+            video_browser_channel=args.video_browser_channel,
+            retention_days=args.retention_days,
+        )
+        report = render_night(client, options)
+    except (NbaStatsError, ValueError, RuntimeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"NBA date: {report['target_date']}")
+    print(f"Games discovered: {report['games_discovered']}")
+    print(f"Games renderable: {report['games_renderable']}")
+    print(
+        "Summary: "
+        f"{report['summary']['success']} success, "
+        f"{report['summary']['skipped']} skipped, "
+        f"{report['summary']['failed']} failed"
+    )
+    if not args.dry_run:
+        report_path = args.output_root / report["target_date"] / "run_report.json"
+        print(f"Run report: {report_path}")
+    for game in report["games"]:
+        suffix = ""
+        if game["skip_reason"]:
+            suffix = f" ({game['skip_reason']})"
+        if game["error"]:
+            suffix = f" ({game['error']})"
+        print(f"{game['status']}: {game['game_id']} {game['matchup']}{suffix}")
+    return 1 if has_failures(report) else 0
 
 
 def run_manifest(args: argparse.Namespace) -> int:
