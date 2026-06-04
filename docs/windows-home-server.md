@@ -1,0 +1,122 @@
+# Windows Home Server Setup
+
+This guide sets up a reset Windows 11 MSI laptop as a flexible local server, with
+`nba-play-recap` as the first workload.
+
+## Server Layout
+
+Use neutral top-level folders so future apps can live beside this project:
+
+```powershell
+C:\srv       # source code, one folder per app
+C:\data      # generated app data and outputs
+C:\logs      # scheduled task logs
+C:\tools     # manually installed tools if needed
+C:\backups   # exported configs and recovery notes
+```
+
+For this app:
+
+```powershell
+C:\srv\nba-play-recap
+C:\data\nba-play-recap\outputs
+C:\logs\nba-play-recap
+```
+
+## First Boot After Reset
+
+1. Finish Windows setup with a dedicated server account where possible.
+2. Avoid restoring old apps, OneDrive sync, and personal settings.
+3. Run Windows Update until the machine is current.
+4. Keep the laptop plugged in and logged in for NBA rendering. The app needs a
+   headed Chrome session to acquire NBA video headers reliably.
+5. Install a visual remote access tool such as Chrome Remote Desktop or RustDesk.
+
+## Bootstrap
+
+Clone the repo under `C:\srv`:
+
+```powershell
+mkdir C:\srv
+cd C:\srv
+git clone <repo-url> nba-play-recap
+cd C:\srv\nba-play-recap
+```
+
+Run PowerShell as Administrator, then:
+
+```powershell
+.\scripts\bootstrap_windows_server.ps1
+```
+
+The bootstrap script:
+
+- creates the server folder layout,
+- installs Git, Chrome, uv, ffmpeg, PowerShell, and VS Code through `winget`,
+- disables plugged-in sleep and hibernate when run elevated,
+- runs `uv sync`, unit tests, and `render-night --dry-run`.
+
+If tools were installed during the script, open a new PowerShell window before
+manual verification.
+
+## Manual Verification
+
+```powershell
+git --version
+uv --version
+ffmpeg -version
+pwsh --version
+cd C:\srv\nba-play-recap
+uv run python -m unittest
+uv run python .\nba_recap.py render-night --dry-run
+```
+
+Run one real batch after dry-run succeeds:
+
+```powershell
+uv run python .\nba_recap.py render-night --output-root C:\data\nba-play-recap\outputs\nightly
+```
+
+## Scheduled Task
+
+Create a Windows Task Scheduler task that runs only when the server user is
+logged on.
+
+Recommended action:
+
+```text
+Program/script:
+powershell.exe
+
+Arguments:
+-NoProfile -ExecutionPolicy Bypass -File C:\srv\nba-play-recap\scripts\run-nightly.ps1
+
+Start in:
+C:\srv\nba-play-recap
+```
+
+Recommended trigger:
+
+```text
+Daily at 08:30 Europe/Paris local time
+```
+
+The scheduled runner:
+
+- pulls the latest repo changes with `git pull --ff-only`,
+- runs `uv sync`,
+- renders the previous NBA night to `C:\data\nba-play-recap\outputs\nightly`,
+- writes a transcript log to `C:\logs\nba-play-recap`.
+
+## Future Apps
+
+For each new app:
+
+- place source code in `C:\srv\<app-name>`,
+- put generated files in `C:\data\<app-name>`,
+- write logs to `C:\logs\<app-name>`,
+- keep project dependencies in that app's own virtual environment,
+- avoid installing dependencies globally unless they are shared tools.
+
+Install Docker, Node.js, databases, or other runtimes only when a concrete app
+needs them.
