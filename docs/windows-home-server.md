@@ -77,6 +77,12 @@ Run one real batch after dry-run succeeds:
 uv run python .\nba_recap.py render-night --output-root C:\data\nba-play-recap\outputs\nightly
 ```
 
+To validate with a known scoreboard date:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\srv\nba-play-recap\scripts\run-nightly.ps1 -Date 2026-05-30
+```
+
 ## Scheduled Task
 
 Create a Windows Task Scheduler task that runs only when the server user is
@@ -106,7 +112,9 @@ The scheduled runner:
 - pulls the latest repo changes with `git pull --ff-only`,
 - runs `uv sync`,
 - renders the previous NBA night to `C:\data\nba-play-recap\outputs\nightly`,
-- writes a transcript log to `C:\logs\nba-play-recap`.
+- writes a transcript log to `C:\logs\nba-play-recap`,
+- treats a post-render browser/session exit as successful only when the written
+  `run_report.json` contains zero failed games.
 
 ## Future Apps
 

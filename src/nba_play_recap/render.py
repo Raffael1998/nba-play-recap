@@ -556,24 +556,30 @@ def acquire_video_headers_with_browser(
                     return
                 if "videos.nba.com/nba/pbp/media/" not in request_url or game_id not in request_url:
                     return
-                captured_headers = dict(request.all_headers())
+                try:
+                    captured_headers = dict(request.all_headers())
+                except PlaywrightError:
+                    return
 
             page.on("request", capture_video_request)
-            deadline = time.perf_counter() + timeout_ms / 1000
             try:
-                page.goto(event_page_url, wait_until="domcontentloaded", timeout=timeout_ms)
-            except PlaywrightTimeoutError:
-                pass
-            while captured_headers is None and time.perf_counter() < deadline:
+                deadline = time.perf_counter() + timeout_ms / 1000
                 try:
-                    page.locator("video").first.evaluate(
-                        "(video) => { video.muted = true; return video.play().catch(() => undefined); }",
-                        timeout=1000,
-                    )
-                except (PlaywrightError, PlaywrightTimeoutError):
+                    page.goto(event_page_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                except PlaywrightTimeoutError:
                     pass
-                page.wait_for_timeout(500)
-            browser.close()
+                while captured_headers is None and time.perf_counter() < deadline:
+                    try:
+                        page.locator("video").first.evaluate(
+                            "(video) => { video.muted = true; return video.play().catch(() => undefined); }",
+                            timeout=1000,
+                        )
+                    except (PlaywrightError, PlaywrightTimeoutError):
+                        pass
+                    page.wait_for_timeout(500)
+            finally:
+                page.remove_listener("request", capture_video_request)
+                browser.close()
     except PlaywrightTimeoutError as exc:
         raise RuntimeError(
             "Chromium timed out while opening the spoiler-free NBA event page for session refresh. "
