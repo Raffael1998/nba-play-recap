@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import gzip
+from http.client import RemoteDisconnected
 import json
 from pathlib import Path
+import time
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -15,7 +17,7 @@ NBA_CDN_BASE_URL = "https://cdn.nba.com/static/json/liveData"
 
 DEFAULT_HEADERS = {
     "Accept": "application/json, text/plain, */*",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Encoding": "gzip, deflate",
     "Accept-Language": "en-US,en;q=0.9",
     "Cache-Control": "no-cache",
     "Connection": "keep-alive",
@@ -50,8 +52,15 @@ class NbaStatsError(RuntimeError):
 
 
 class NbaStatsClient:
-    def __init__(self, timeout_seconds: int = 30) -> None:
+    def __init__(
+        self,
+        timeout_seconds: int = 30,
+        request_retries: int = 3,
+        retry_backoff_seconds: float = 1.5,
+    ) -> None:
         self.timeout_seconds = timeout_seconds
+        self.request_retries = request_retries
+        self.retry_backoff_seconds = retry_backoff_seconds
 
     def get_json(
         self,
@@ -73,16 +82,35 @@ class NbaStatsClient:
         if headers is not None:
             request = Request(url, headers=headers)
 
-        try:
-            with urlopen(request, timeout=timeout_seconds or self.timeout_seconds) as response:
-                raw_payload = response.read()
-                encoding = response.headers.get("Content-Encoding", "").lower()
-        except HTTPError as exc:
-            raise NbaStatsError(f"NBA stats request failed with HTTP {exc.code}: {url}") from exc
-        except URLError as exc:
-            raise NbaStatsError(f"NBA stats request failed: {exc.reason}") from exc
-        except TimeoutError as exc:
-            raise NbaStatsError(f"NBA stats request timed out: {url}") from exc
+        raw_payload: bytes | None = None
+        encoding = ""
+        attempts = max(self.request_retries, 1)
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                with urlopen(request, timeout=timeout_seconds or self.timeout_seconds) as response:
+                    raw_payload = response.read()
+                    encoding = response.headers.get("Content-Encoding", "").lower()
+                break
+            except HTTPError as exc:
+                raise NbaStatsError(f"NBA stats request failed with HTTP {exc.code}: {url}") from exc
+            except (RemoteDisconnected, URLError, TimeoutError) as exc:
+                last_error = exc
+                if attempt < attempts:
+                    time.sleep(self.retry_backoff_seconds * attempt)
+
+        if raw_payload is None:
+            if isinstance(last_error, URLError):
+                raise NbaStatsError(
+                    f"NBA stats request failed after {attempts} attempts: {last_error.reason}"
+                ) from last_error
+            if isinstance(last_error, TimeoutError):
+                raise NbaStatsError(
+                    f"NBA stats request timed out after {attempts} attempts: {url}"
+                ) from last_error
+            raise NbaStatsError(
+                f"NBA stats request failed after {attempts} attempts: {url}"
+            ) from last_error
 
         payload = _decode_payload(raw_payload, encoding)
 
