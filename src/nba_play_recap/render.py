@@ -576,37 +576,40 @@ def acquire_video_headers_with_browser(
                     captured_headers = dict(getattr(request, "headers", {}))
 
             page.on("request", capture_video_request)
-            deadline = time.perf_counter() + timeout_ms / 1000
             try:
-                page.goto(event_page_url, wait_until="domcontentloaded", timeout=timeout_ms)
-            except PlaywrightTimeoutError:
-                pass
-            while captured_headers is None and time.perf_counter() < deadline:
+                deadline = time.perf_counter() + timeout_ms / 1000
                 try:
-                    page.locator("video").first.evaluate(
-                        "(video) => { video.muted = true; return video.play().catch(() => undefined); }",
-                        timeout=1000,
-                    )
-                except (PlaywrightError, PlaywrightTimeoutError):
-                    pass
-                page.wait_for_timeout(500)
-            if captured_headers is None:
-                try:
-                    request = page.wait_for_event(
-                        "request",
-                        predicate=lambda request: (
-                            "videos.nba.com/nba/pbp/media/" in request.url
-                            and game_id in request.url
-                        ),
-                        timeout=2000,
-                    )
-                    try:
-                        captured_headers = dict(request.all_headers())
-                    except PlaywrightError:
-                        captured_headers = dict(request.headers)
+                    page.goto(event_page_url, wait_until="domcontentloaded", timeout=timeout_ms)
                 except PlaywrightTimeoutError:
                     pass
-            browser.close()
+                while captured_headers is None and time.perf_counter() < deadline:
+                    try:
+                        page.locator("video").first.evaluate(
+                            "(video) => { video.muted = true; return video.play().catch(() => undefined); }",
+                            timeout=1000,
+                        )
+                    except (PlaywrightError, PlaywrightTimeoutError):
+                        pass
+                    page.wait_for_timeout(500)
+                if captured_headers is None:
+                    try:
+                        request = page.wait_for_event(
+                            "request",
+                            predicate=lambda request: (
+                                "videos.nba.com/nba/pbp/media/" in request.url
+                                and game_id in request.url
+                            ),
+                            timeout=2000,
+                        )
+                        try:
+                            captured_headers = dict(request.all_headers())
+                        except PlaywrightError:
+                            captured_headers = dict(request.headers)
+                    except PlaywrightTimeoutError:
+                        pass
+            finally:
+                page.remove_listener("request", capture_video_request)
+                browser.close()
     except PlaywrightTimeoutError as exc:
         raise RuntimeError(
             "Chromium timed out while opening the spoiler-free NBA event page for session refresh. "

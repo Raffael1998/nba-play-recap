@@ -193,6 +193,15 @@ For a Windows VM, schedule the command in an interactive desktop session with Ch
 
 See [docs/deployment.md](docs/deployment.md) for cloud VM options and a `systemd` timer setup.
 
+## Windows Home Server
+
+For a local always-on Windows laptop/server setup, see [docs/windows-home-server.md](docs/windows-home-server.md).
+
+The repo includes:
+
+- `scripts/bootstrap_windows_server.ps1` to create the server folder layout, install base tools, configure plugged-in power behavior, and verify the project.
+- `scripts/run-nightly.ps1` to run the nightly batch with logs and an output root outside the repo.
+
 ## Candidate Inspection
 
 To inspect raw clip-backed candidates before the full pipeline:
