@@ -202,6 +202,32 @@ The repo includes:
 - `scripts/bootstrap_windows_server.ps1` to create the server folder layout, install base tools, configure plugged-in power behavior, and verify the project.
 - `scripts/run-nightly.ps1` to run the nightly batch with logs and an output root outside the repo.
 
+## YouTube Uploads
+
+After rendering, successful nightly outputs can be uploaded through the YouTube
+Data API:
+
+```powershell
+uv run python .\nba_recap.py youtube-auth `
+  --client-secrets C:\data\nba-play-recap\secrets\youtube_client_secret.json
+
+uv run python .\nba_recap.py publish-night `
+  --report C:\data\nba-play-recap\outputs\nightly\<YYYY-MM-DD>\run_report.json
+```
+
+To render and upload in one command:
+
+```powershell
+uv run python .\nba_recap.py render-night `
+  --output-root C:\data\nba-play-recap\outputs\nightly `
+  --publish-youtube
+```
+
+The uploader stores per-game status in `youtube_status.json` next to each game
+output and skips games already uploaded unless `--force-upload` is passed.
+OAuth client secrets and tokens should stay outside the repo under
+`C:\data\nba-play-recap\secrets`.
+
 ## Candidate Inspection
 
 To inspect raw clip-backed candidates before the full pipeline:

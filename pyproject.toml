@@ -9,6 +9,9 @@ description = "Build short NBA recaps from play-by-play data and official event 
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "google-api-python-client>=2.187.0",
+    "google-auth-httplib2>=0.2.0",
+    "google-auth-oauthlib>=1.2.2",
     "playwright>=1.60.0",
     "tzdata>=2025.2",
 ]

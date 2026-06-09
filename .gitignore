@@ -13,4 +13,8 @@ debug_clip_download*.cmd
 debug_clip_download*.ps1
 debug_clip_downloads/
 
+youtube_client_secret*.json
+youtube_token*.json
+youtube_status.json
+
 .DS_Store

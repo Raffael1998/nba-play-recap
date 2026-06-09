@@ -29,6 +29,14 @@ from nba_play_recap.render import (
     write_debug_report,
     write_manifests,
 )
+from nba_play_recap.youtube import (
+    DEFAULT_CLIENT_SECRETS_PATH,
+    DEFAULT_PRIVACY_STATUS,
+    DEFAULT_TOKEN_PATH,
+    authorize_youtube,
+    has_publish_failures,
+    publish_night_report,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -281,6 +289,85 @@ def build_parser() -> argparse.ArgumentParser:
         default=2.0,
         help="Assumed replay or setup time at the end of a clip.",
     )
+    render_night_parser.add_argument(
+        "--publish-youtube",
+        action="store_true",
+        help="Upload successful rendered games to YouTube after the nightly render completes.",
+    )
+    render_night_parser.add_argument(
+        "--youtube-client-secrets",
+        type=Path,
+        default=DEFAULT_CLIENT_SECRETS_PATH,
+        help="Path to the YouTube OAuth desktop client JSON.",
+    )
+    render_night_parser.add_argument(
+        "--youtube-token",
+        type=Path,
+        default=DEFAULT_TOKEN_PATH,
+        help="Path to the stored YouTube OAuth token JSON.",
+    )
+    render_night_parser.add_argument(
+        "--youtube-privacy",
+        default=DEFAULT_PRIVACY_STATUS,
+        choices=("public", "unlisted", "private"),
+        help="Requested YouTube privacy status for uploaded videos.",
+    )
+    render_night_parser.add_argument(
+        "--force-upload",
+        action="store_true",
+        help="Upload even when youtube_status.json already records a successful upload.",
+    )
+
+    publish_night_parser = subparsers.add_parser(
+        "publish-night",
+        help="Upload successful rendered games from a nightly run_report.json to YouTube.",
+    )
+    publish_night_parser.add_argument(
+        "--report",
+        type=Path,
+        required=True,
+        help="Path to nightly run_report.json.",
+    )
+    publish_night_parser.add_argument(
+        "--client-secrets",
+        type=Path,
+        default=DEFAULT_CLIENT_SECRETS_PATH,
+        help="Path to the YouTube OAuth desktop client JSON.",
+    )
+    publish_night_parser.add_argument(
+        "--token",
+        type=Path,
+        default=DEFAULT_TOKEN_PATH,
+        help="Path to the stored YouTube OAuth token JSON.",
+    )
+    publish_night_parser.add_argument(
+        "--privacy",
+        default=DEFAULT_PRIVACY_STATUS,
+        choices=("public", "unlisted", "private"),
+        help="Requested YouTube privacy status for uploaded videos.",
+    )
+    publish_night_parser.add_argument(
+        "--force-upload",
+        action="store_true",
+        help="Upload even when youtube_status.json already records a successful upload.",
+    )
+
+    youtube_auth_parser = subparsers.add_parser(
+        "youtube-auth",
+        help="Authorize YouTube uploads and save an OAuth refresh token outside the repo.",
+    )
+    youtube_auth_parser.add_argument(
+        "--client-secrets",
+        type=Path,
+        default=DEFAULT_CLIENT_SECRETS_PATH,
+        help="Path to the YouTube OAuth desktop client JSON.",
+    )
+    youtube_auth_parser.add_argument(
+        "--token",
+        type=Path,
+        default=DEFAULT_TOKEN_PATH,
+        help="Path where the YouTube OAuth token JSON will be saved.",
+    )
 
     manifest = subparsers.add_parser(
         "manifest",
@@ -380,6 +467,10 @@ def main() -> int:
         return run_render_full_game(args)
     if args.command == "render-night":
         return run_render_night(args)
+    if args.command == "publish-night":
+        return run_publish_night(args)
+    if args.command == "youtube-auth":
+        return run_youtube_auth(args)
     if args.command == "game-id":
         return run_game_id_lookup(args)
 
@@ -595,7 +686,66 @@ def run_render_night(args: argparse.Namespace) -> int:
         if game["error"]:
             suffix = f" ({game['error']})"
         print(f"{game['status']}: {game['game_id']} {game['matchup']}{suffix}")
-    return 1 if has_failures(report) else 0
+    if has_failures(report):
+        return 1
+    if args.publish_youtube and not args.dry_run:
+        report_path = args.output_root / report["target_date"] / "run_report.json"
+        publish_report = publish_night_report(
+            report_path=report_path,
+            client_secrets_path=args.youtube_client_secrets,
+            token_path=args.youtube_token,
+            privacy_status=args.youtube_privacy,
+            force_upload=args.force_upload,
+        )
+        print_publish_report(publish_report)
+        return 1 if has_publish_failures(publish_report) else 0
+    if args.publish_youtube and args.dry_run:
+        print("YouTube publishing skipped because --dry-run was used.")
+    return 0
+
+
+def run_publish_night(args: argparse.Namespace) -> int:
+    try:
+        publish_report = publish_night_report(
+            report_path=args.report,
+            client_secrets_path=args.client_secrets,
+            token_path=args.token,
+            privacy_status=args.privacy,
+            force_upload=args.force_upload,
+        )
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print_publish_report(publish_report)
+    return 1 if has_publish_failures(publish_report) else 0
+
+
+def run_youtube_auth(args: argparse.Namespace) -> int:
+    try:
+        token_path = authorize_youtube(args.client_secrets, args.token)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(f"YouTube token saved: {token_path}")
+    return 0
+
+
+def print_publish_report(report: dict) -> None:
+    summary = report["summary"]
+    print(
+        "YouTube publish summary: "
+        f"{summary['success']} success, "
+        f"{summary['skipped']} skipped, "
+        f"{summary['failed']} failed"
+    )
+    for game in report["games"]:
+        suffix = ""
+        if game.get("skip_reason"):
+            suffix = f" ({game['skip_reason']})"
+        if game.get("error"):
+            suffix = f" ({game['error']})"
+        video_id = game.get("video_id") or "-"
+        print(f"youtube {game['status']}: {game['game_id']} {game['matchup']} video_id={video_id}{suffix}")
 
 
 def run_manifest(args: argparse.Namespace) -> int:

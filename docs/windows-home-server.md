@@ -116,6 +116,50 @@ The scheduled runner:
 - treats a post-render browser/session exit as successful only when the written
   `run_report.json` contains zero failed games.
 
+## YouTube Upload Automation
+
+YouTube publishing is disabled until OAuth is configured and a manual upload is
+validated.
+
+1. In Google Cloud, enable YouTube Data API v3 and create an OAuth Desktop app.
+2. Save the OAuth client JSON here:
+
+```text
+C:\data\nba-play-recap\secrets\youtube_client_secret.json
+```
+
+3. Authorize the channel once from an interactive PowerShell session:
+
+```powershell
+cd C:\srv\nba-play-recap
+uv run python .\nba_recap.py youtube-auth `
+  --client-secrets C:\data\nba-play-recap\secrets\youtube_client_secret.json
+```
+
+The refresh token is saved to:
+
+```text
+C:\data\nba-play-recap\secrets\youtube_token.json
+```
+
+4. Publish a known rendered night manually:
+
+```powershell
+uv run python .\nba_recap.py publish-night `
+  --report C:\data\nba-play-recap\outputs\nightly\2026-05-30\run_report.json
+```
+
+5. Re-run the same command and confirm it skips with `already_uploaded`.
+6. After manual validation, enable scheduled publishing by adding
+   `-PublishYouTube` to the scheduled task action:
+
+```text
+-NoProfile -ExecutionPolicy Bypass -File C:\srv\nba-play-recap\scripts\run-nightly.ps1 -PublishYouTube
+```
+
+Uploads request public visibility and set `selfDeclaredMadeForKids` to false.
+YouTube may still force private uploads for unverified API projects.
+
 ## Future Apps
 
 For each new app:

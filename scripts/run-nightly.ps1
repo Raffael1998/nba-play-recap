@@ -4,6 +4,7 @@ param(
     [string] $LogRoot = "C:\logs\nba-play-recap",
     [string] $Date,
     [int] $RetentionDays = 14,
+    [switch] $PublishYouTube,
     [switch] $SkipGitPull,
     [string[]] $ExtraArgs = @()
 )
@@ -14,6 +15,7 @@ function Refresh-Path {
     $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
     $env:Path = "C:\Program Files\Git\cmd;$machinePath;$userPath"
+    $env:PYTHONWARNINGS = "ignore::FutureWarning:google.api_core._python_version_support"
 }
 
 function Get-RunReportPath {
@@ -47,6 +49,7 @@ try {
     Write-Host "AppDir: $AppDir"
     Write-Host "OutputRoot: $OutputRoot"
     Write-Host "LogPath: $logPath"
+    Write-Host "PublishYouTube: $PublishYouTube"
 
     if (-not (Test-Path -LiteralPath $AppDir)) {
         throw "App directory not found: $AppDir"
@@ -73,6 +76,10 @@ try {
             $arguments += @("--date", $Date)
         }
 
+        if ($PublishYouTube) {
+            $arguments += "--publish-youtube"
+        }
+
         $arguments += $ExtraArgs
 
         $renderOutput = & uv run python @arguments 2>&1
@@ -81,7 +88,7 @@ try {
 
         if ($renderExitCode -ne 0) {
             $reportPath = Get-RunReportPath -Lines $renderOutput
-            if (Test-RunReportHasNoFailures -ReportPath $reportPath) {
+            if (-not $PublishYouTube -and (Test-RunReportHasNoFailures -ReportPath $reportPath)) {
                 Write-Warning "uv exited with $renderExitCode, but the run report has zero failed games: $reportPath"
             } else {
                 throw "render-night failed with exit code $renderExitCode"
