@@ -228,11 +228,25 @@ def download_available_clips(
         if clip_path.exists():
             try:
                 _reject_video_not_available_placeholder(clip_path)
-            except RuntimeError:
+            except RuntimeError as exc:
+                if not _is_video_not_available_placeholder_error(exc):
+                    raise
                 clip_path.unlink()
         if not clip_path.exists():
             _download_file(candidate.clip_url, clip_path, headers=video_headers)
-        _reject_video_not_available_placeholder(clip_path)
+        try:
+            _reject_video_not_available_placeholder(clip_path)
+        except RuntimeError as exc:
+            if not _is_video_not_available_placeholder_error(exc):
+                raise
+            clip_path.unlink(missing_ok=True)
+            candidate.video_available = False
+            candidate.availability_status = "placeholder"
+            candidate.availability_error = str(exc)
+            candidate.included_in_render = False
+            if progress is not None:
+                progress.advance()
+            continue
         downloaded_paths[candidate.event_num] = clip_path
         if progress is not None:
             progress.advance()
@@ -559,7 +573,7 @@ def acquire_video_headers_with_browser(
                 try:
                     captured_headers = dict(request.all_headers())
                 except PlaywrightError:
-                    return
+                    captured_headers = dict(getattr(request, "headers", {}))
 
             page.on("request", capture_video_request)
             try:
@@ -577,6 +591,22 @@ def acquire_video_headers_with_browser(
                     except (PlaywrightError, PlaywrightTimeoutError):
                         pass
                     page.wait_for_timeout(500)
+                if captured_headers is None:
+                    try:
+                        request = page.wait_for_event(
+                            "request",
+                            predicate=lambda request: (
+                                "videos.nba.com/nba/pbp/media/" in request.url
+                                and game_id in request.url
+                            ),
+                            timeout=2000,
+                        )
+                        try:
+                            captured_headers = dict(request.all_headers())
+                        except PlaywrightError:
+                            captured_headers = dict(request.headers)
+                    except PlaywrightTimeoutError:
+                        pass
             finally:
                 page.remove_listener("request", capture_video_request)
                 browser.close()
@@ -657,6 +687,10 @@ def _reject_video_not_available_placeholder(clip_path: Path) -> None:
         "from Chrome DevTools as PowerShell and pass --no-auto-video-session "
         "with --video-session-script."
     )
+
+
+def _is_video_not_available_placeholder_error(exc: RuntimeError) -> bool:
+    return "Video not available" in str(exc)
 
 
 def _run_ffmpeg_with_progress(

@@ -635,10 +635,14 @@ def run_render_full_game(args: argparse.Namespace) -> int:
 
 
 def run_render_night(args: argparse.Namespace) -> int:
-    client = NbaStatsClient()
     try:
         if args.retention_days < 1:
             raise ValueError("--retention-days must be at least 1.")
+        client = NbaStatsClient(
+            timeout_seconds=args.request_timeout_seconds,
+            request_retries=args.request_retries,
+            retry_backoff_seconds=args.retry_backoff_seconds,
+        )
         target_date = resolve_nba_scoreboard_date(args.target_date)
         options = RenderNightOptions(
             target_date=target_date,
