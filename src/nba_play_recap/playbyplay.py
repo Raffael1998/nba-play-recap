@@ -35,55 +35,41 @@ class CandidatePlay:
         return asdict(self)
 
 
-def extract_video_candidates(payload: dict[str, Any], game_id: str) -> list[CandidatePlay]:
-    tables = _extract_named_tables(payload)
-    play_rows = tables.get("PlayByPlay")
-    if not play_rows:
-        raise ValueError("The play-by-play payload did not contain a PlayByPlay dataset.")
-    video_rows = tables.get("AvailableVideo")
-    video_flags = _extract_video_flags(play_rows, video_rows)
-
-    candidates: list[CandidatePlay] = []
-    for row in play_rows:
-        event_num = _as_int(row.get("EVENTNUM"))
-        if event_num is None or not video_flags.get(event_num, False):
-            continue
-
-        candidates.append(
-            CandidatePlay(
-                game_id=game_id,
-                event_num=event_num,
-                period=_as_int(row.get("PERIOD")),
-                clock=_as_str(row.get("PCTIMESTRING")),
-                clock_seconds_remaining=_clock_seconds_from_display(_as_str(row.get("PCTIMESTRING"))),
-                description=_build_description(row),
-                home_score=_as_str(row.get("SCORE")).split(" - ")[-1] if row.get("SCORE") and " - " in str(row.get("SCORE")) else None,
-                visitor_score=_as_str(row.get("SCORE")).split(" - ")[0] if row.get("SCORE") and " - " in str(row.get("SCORE")) else None,
-                score_margin=_as_str(row.get("SCOREMARGIN")),
-                event_msg_type=_as_int(row.get("EVENTMSGTYPE")),
-                video_available=True,
-            )
-        )
-
-    return candidates
-
-
-def extract_live_candidate_actions(
-    payload: dict[str, Any],
+def extract_candidate_actions(
+    actions: list[dict[str, Any]],
     game_id: str,
-    include_action_types: set[str] | None = None,
+    exclude_action_types: set[str] | None = None,
+    video_only: bool = True,
 ) -> list[CandidatePlay]:
-    actions = payload.get("game", {}).get("actions")
-    if not isinstance(actions, list):
-        raise ValueError("The live play-by-play payload did not contain a game.actions list.")
+    """Turn a game page's `playByPlay.actions` into candidates.
 
+    The actions come from `__NEXT_DATA__.props.pageProps.playByPlay` on the game page,
+    which is server-rendered and needs no API host (D-036). Each action carries its own
+    `videoAvailable` flag, so `video_only` filters out the ~100 actions per game that
+    have no clip **before** any request is made for one — the previous design probed
+    every event and learned the same thing 100 requests later.
+
+    **The filter is a denylist on purpose**, and it is the second thing this page's
+    vocabulary has caught out. The action types here are *not* the live CDN feed's
+    (`2pt`, `3pt`, `freethrow`, …) but a display vocabulary — `Made Shot`, `Missed
+    Shot`, `Free Throw` — and **blocks and steals carry an empty `actionType`
+    entirely**. An allowlist written against the old names selected nothing at all and
+    reported a game with zero events, which reads exactly like a broken feed. A
+    denylist fails the other way: an unrecognised type ends up *in* the recap, which is
+    visible in the output rather than silent.
+    """
     candidates: list[CandidatePlay] = []
+    excluded = exclude_action_types or set()
     for action in actions:
         if not isinstance(action, dict):
             continue
 
         action_type = _as_str(action.get("actionType"))
-        if include_action_types and action_type not in include_action_types:
+        if action_type in excluded:
+            continue
+
+        has_video = bool(_as_int(action.get("videoAvailable")))
+        if video_only and not has_video:
             continue
 
         event_num = _as_int(action.get("actionNumber"))
@@ -102,7 +88,7 @@ def extract_live_candidate_actions(
                 visitor_score=_as_str(action.get("scoreAway")),
                 score_margin=_score_margin(_as_str(action.get("scoreAway")), _as_str(action.get("scoreHome"))),
                 event_msg_type=None,
-                video_available=False,
+                video_available=has_video,
                 action_type=action_type,
                 team_tricode=_as_str(action.get("teamTricode")),
             )
@@ -136,76 +122,6 @@ def attach_video_metadata(candidate: CandidatePlay, payload: dict[str, Any]) -> 
     return candidate
 
 
-def _extract_named_tables(payload: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
-    tables: dict[str, list[dict[str, Any]]] = {}
-
-    data_sets = payload.get("data_sets")
-    if isinstance(data_sets, dict):
-        for name, rows in data_sets.items():
-            if isinstance(rows, list):
-                tables[name] = [row for row in rows if isinstance(row, dict)]
-        if tables:
-            return tables
-
-    result_sets = payload.get("resultSets")
-    if isinstance(result_sets, list):
-        for table in result_sets:
-            name = table.get("name")
-            headers = table.get("headers") or []
-            rows = table.get("rowSet") or []
-            if isinstance(name, str):
-                tables[name] = [_zip_row(headers, row) for row in rows]
-        return tables
-
-    if isinstance(result_sets, dict):
-        for name, table in result_sets.items():
-            headers = table.get("headers") or []
-            rows = table.get("rowSet") or []
-            tables[name] = [_zip_row(headers, row) for row in rows]
-        return tables
-
-    raise ValueError("The play-by-play payload did not contain a recognized resultSets structure.")
-
-
-def _extract_video_flags(
-    play_rows: list[dict[str, Any]],
-    video_rows: list[dict[str, Any]] | None,
-) -> dict[int, bool]:
-    if any("VIDEO_AVAILABLE_FLAG" in row for row in play_rows):
-        return {
-            event_num: bool(_as_int(row.get("VIDEO_AVAILABLE_FLAG")))
-            for row in play_rows
-            if (event_num := _as_int(row.get("EVENTNUM"))) is not None
-        }
-
-    if video_rows is None:
-        raise ValueError(
-            "The play-by-play payload did not expose video availability in PlayByPlay or AvailableVideo."
-        )
-
-    flags: dict[int, bool] = {}
-    for index, row in enumerate(video_rows):
-        event_num = _as_int(row.get("GAME_EVENT_ID") or row.get("EVENTNUM"))
-        if event_num is None and index < len(play_rows):
-            event_num = _as_int(play_rows[index].get("EVENTNUM"))
-        if event_num is None:
-            continue
-        flags[event_num] = bool(_as_int(row.get("VIDEO_AVAILABLE_FLAG")))
-    return flags
-
-
-def _zip_row(headers: list[Any], row: list[Any]) -> dict[str, Any]:
-    return {str(header): value for header, value in zip(headers, row)}
-
-
-def _build_description(row: dict[str, Any]) -> str:
-    for key in ("HOMEDESCRIPTION", "VISITORDESCRIPTION", "NEUTRALDESCRIPTION"):
-        value = _as_str(row.get(key))
-        if value:
-            return value
-    return "Unknown event"
-
-
 def _as_int(value: Any) -> int | None:
     if value in (None, ""):
         return None
@@ -235,16 +151,6 @@ def _clock_seconds_from_iso_duration(value: str | None) -> float | None:
         return None
     minutes_part = value[2:].split("M", maxsplit=1)[0]
     seconds_part = value.split("M", maxsplit=1)[1].rstrip("S")
-    try:
-        return int(minutes_part) * 60 + float(seconds_part)
-    except ValueError:
-        return None
-
-
-def _clock_seconds_from_display(value: str | None) -> float | None:
-    if not value or ":" not in value:
-        return None
-    minutes_part, seconds_part = value.split(":", maxsplit=1)
     try:
         return int(minutes_part) * 60 + float(seconds_part)
     except ValueError:

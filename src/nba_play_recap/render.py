@@ -1,63 +1,33 @@
 from __future__ import annotations
 
 import hashlib
-import re
 import shutil
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 import json
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
 
-from nba_play_recap.client import DEFAULT_HEADERS, NbaStatsClient, NbaStatsError
-from nba_play_recap.playbyplay import CandidatePlay, attach_video_metadata, extract_live_candidate_actions
+from nba_play_recap.browser import (
+    VIDEO_NOT_AVAILABLE_BYTES,
+    NbaBrowser,
+    NbaBrowserError,
+)
+from nba_play_recap.playbyplay import CandidatePlay, attach_video_metadata, extract_candidate_actions
 from nba_play_recap.progress import ProgressReporter
 
-DEFAULT_PLAY_ACTION_TYPES = {
-    "2pt",
-    "3pt",
-    "block",
-    "foul",
-    "freethrow",
-    "jumpball",
-    "rebound",
-    "steal",
-    "turnover",
-    "violation",
+# Everything on a game page's timeline is a play worth watching except these. Measured
+# against game 0042500402 (520 actions): Substitution 63, Timeout 14, Instant Replay 3,
+# period 8 — none of which is basketball. Blocks and steals carry an EMPTY actionType,
+# so they must not be excluded by accident. See extract_candidate_actions for why this
+# is a denylist rather than a list of wanted types.
+EXCLUDED_ACTION_TYPES = {
+    "Substitution",
+    "Timeout",
+    "Instant Replay",
+    "period",
 }
-
-
-VIDEO_HEADERS = {
-    "Accept": "*/*",
-    "Accept-Encoding": "identity;q=1, *;q=0",
-    "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-    "Range": "bytes=0-",
-    "Referer": "https://www.nba.com/",
-    "User-Agent": DEFAULT_HEADERS["User-Agent"],
-}
-
-POWERSHELL_COOKIE_PATTERN = re.compile(
-    r'New-Object\s+System\.Net\.Cookie\("(?P<name>[^"]+)",\s*"(?P<value>(?:`"|[^"])*)"',
-    re.IGNORECASE,
-)
-POWERSHELL_HEADER_PATTERN = re.compile(
-    r'^\s*"(?P<name>[^"]+)"="(?P<value>(?:`"|[^"])*)"',
-    re.MULTILINE,
-)
-POWERSHELL_USER_AGENT_PATTERN = re.compile(
-    r'^\s*\$session\.UserAgent\s*=\s*"(?P<value>(?:`"|[^"])*)"',
-    re.MULTILINE,
-)
-KNOWN_VIDEO_NOT_AVAILABLE_SHA256 = (
-    "45934326c3cac055be7389cc27484107cafbda429afa54ca35b3ac2350df79a0"
-)
 
 
 @dataclass(slots=True)
@@ -89,24 +59,29 @@ class FetchDebugStats:
 
 
 def build_game_manifest(
-    client: NbaStatsClient,
-    game_id: str,    
-    max_workers: int = 4,
-    action_types: set[str] | None = None,
+    browser: NbaBrowser,
+    game_id: str,
+    exclude_action_types: set[str] | None = None,
     cache_dir: Path | None = None,
     max_events: int | None = None,
-    request_retries: int = 3,
-    retry_backoff_seconds: float = 1.5,
-    request_timeout_seconds: int = 10,
     progress: ProgressReporter | None = None,
 ) -> tuple[list[CandidatePlay], FetchDebugStats]:
+    """Read the game's play-by-play and resolve a clip URL for each candidate play.
+
+    Both halves come from the browser: the actions out of the page's own props, and the
+    clip metadata out of an in-page fetch. There is no thread pool because Playwright's
+    sync API is not thread-safe — concurrency lives inside the page instead, where
+    `video_event_assets` issues each batch as one `Promise.all`.
+    """
     debug_stats = FetchDebugStats()
     probe_started_at = time.perf_counter()
-    payload = client.get_live_playbyplay(game_id)
-    candidates = extract_live_candidate_actions(
-        payload,
+    actions = browser.open_game(game_id)
+    candidates = extract_candidate_actions(
+        actions,
         game_id,
-        include_action_types=action_types or DEFAULT_PLAY_ACTION_TYPES,
+        exclude_action_types=(
+            EXCLUDED_ACTION_TYPES if exclude_action_types is None else exclude_action_types
+        ),
     )
     if max_events is not None:
         candidates = candidates[:max_events]
@@ -124,45 +99,27 @@ def build_game_manifest(
     if progress is not None:
         progress.start_phase("Probing clip metadata", total=len(unresolved_candidates))
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_candidate = {
-            executor.submit(
-                _fetch_video_event_asset_with_retry,
-                client,
-                game_id,
-                candidate.event_num,
-                request_retries,
-                retry_backoff_seconds,
-                request_timeout_seconds,
-            ): candidate
-            for candidate in unresolved_candidates
-        }
-        for future in as_completed(future_to_candidate):
-            candidate = future_to_candidate[future]
-            try:
-                fetch_result = future.result()
-            except Exception as exc:
-                candidate.video_available = False
-                candidate.availability_status = "error"
-                candidate.availability_error = str(exc)
-                debug_stats.fetch_failures += 1
-                continue
-            debug_stats.events_probed += 1
-            debug_stats.retries += max(fetch_result["attempts"] - 1, 0)
-            if fetch_result["payload"] is None:
-                candidate.video_available = False
-                candidate.availability_status = "error"
-                candidate.availability_error = fetch_result["error"]
-                debug_stats.fetch_failures += 1
-                continue
-            _write_cached_video_payload(cache_dir, game_id, candidate.event_num, fetch_result["payload"])
-            attach_video_metadata(candidate, fetch_result["payload"])
-            if candidate.video_available:
-                debug_stats.fetch_successes += 1
-            else:
-                debug_stats.fetch_missing += 1
-            if progress is not None:
-                progress.advance()
+    by_event = {candidate.event_num: candidate for candidate in unresolved_candidates}
+    payloads = browser.video_event_assets(game_id, list(by_event))
+    for event_num, payload in payloads.items():
+        candidate = by_event[event_num]
+        debug_stats.events_probed += 1
+        if payload.get("error") or not _is_valid_video_payload(payload):
+            candidate.video_available = False
+            candidate.availability_status = "error"
+            candidate.availability_error = str(
+                payload.get("error") or "videoeventsasset returned no usable clip URL"
+            )
+            debug_stats.fetch_failures += 1
+            continue
+        _write_cached_video_payload(cache_dir, game_id, event_num, payload)
+        attach_video_metadata(candidate, payload)
+        if candidate.video_available:
+            debug_stats.fetch_successes += 1
+        else:
+            debug_stats.fetch_missing += 1
+        if progress is not None:
+            progress.advance()
     if progress is not None:
         progress.complete_phase("Clip metadata probe")
     debug_stats.video_probe_seconds = round(time.perf_counter() - probe_started_at, 3)
@@ -207,11 +164,20 @@ def write_manifests(candidates: list[CandidatePlay], output_dir: Path, game_id: 
 
 
 def download_available_clips(
+    browser: NbaBrowser,
     candidates: list[CandidatePlay],
     clip_dir: Path,
     progress: ProgressReporter | None = None,
-    video_headers: dict[str, str] | None = None,
+    retries: int = 2,
 ) -> dict[int, Path]:
+    """Download each included clip through the browser, skipping what is already there.
+
+    A clip that cannot be obtained drops out of the render rather than failing the game:
+    one missing play is a slightly shorter recap, and a whole game lost to it is not a
+    trade worth making. What it must never do is keep NBA's placeholder object — that is
+    served with a 200, so nothing else would notice, and it would splice 15 s of "video
+    not available" into the middle of the recap.
+    """
     clip_dir.mkdir(parents=True, exist_ok=True)
     downloaded_paths: dict[int, Path] = {}
     clips_to_download = [
@@ -221,38 +187,53 @@ def download_available_clips(
     ]
     if progress is not None:
         progress.start_phase("Downloading clips", total=len(clips_to_download))
-    for candidate in candidates:
-        if not candidate.video_available or not candidate.clip_url or not candidate.included_in_render:
-            continue
+
+    for candidate in clips_to_download:
         clip_path = clip_dir / f"{candidate.event_num:05d}.mp4"
-        if clip_path.exists():
-            try:
-                _reject_video_not_available_placeholder(clip_path)
-            except RuntimeError as exc:
-                if not _is_video_not_available_placeholder_error(exc):
-                    raise
-                clip_path.unlink()
+        if clip_path.exists() and clip_path.stat().st_size == VIDEO_NOT_AVAILABLE_BYTES:
+            clip_path.unlink()
+
         if not clip_path.exists():
-            _download_file(candidate.clip_url, clip_path, headers=video_headers)
-        try:
-            _reject_video_not_available_placeholder(clip_path)
-        except RuntimeError as exc:
-            if not _is_video_not_available_placeholder_error(exc):
-                raise
-            clip_path.unlink(missing_ok=True)
-            candidate.video_available = False
-            candidate.availability_status = "placeholder"
-            candidate.availability_error = str(exc)
-            candidate.included_in_render = False
-            if progress is not None:
-                progress.advance()
-            continue
+            error = _download_clip_with_retries(
+                browser, candidate.clip_url or "", clip_path, retries
+            )
+            if error is not None:
+                clip_path.unlink(missing_ok=True)
+                candidate.video_available = False
+                candidate.availability_status = "placeholder" if "placeholder" in error else "error"
+                candidate.availability_error = error
+                candidate.included_in_render = False
+                if progress is not None:
+                    progress.advance()
+                continue
+
         downloaded_paths[candidate.event_num] = clip_path
         if progress is not None:
             progress.advance()
+
     if progress is not None:
         progress.complete_phase("Clip download")
     return downloaded_paths
+
+
+def _download_clip_with_retries(
+    browser: NbaBrowser,
+    clip_url: str,
+    clip_path: Path,
+    retries: int,
+) -> str | None:
+    """Return None on success, or the last error message."""
+    attempts = max(retries, 1)
+    last_error: str | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            browser.download_clip(clip_url, clip_path)
+            return None
+        except NbaBrowserError as exc:
+            last_error = str(exc)
+            if attempt < attempts:
+                time.sleep(1.0 * attempt)
+    return last_error or "clip download failed"
 
 
 def write_concat_list(clip_paths: list[Path], output_dir: Path, game_id: str) -> Path:
@@ -352,39 +333,26 @@ def cleanup_clips(clip_dir: Path) -> None:
 
 
 def render_full_game(
-    client: NbaStatsClient,
+    browser: NbaBrowser,
     game_id: str,
     output_dir: Path,
     ffmpeg_binary: str,
     keep_clips: bool,
-    max_workers: int,
     max_events: int | None,
-    request_retries: int,
-    retry_backoff_seconds: float,
-    request_timeout_seconds: int,
+    clip_retries: int,
     prune_overlap: bool,
     prune_pre_buffer_seconds: float,
     prune_post_buffer_seconds: float,
-    video_session_script: Path | None = None,
-    auto_video_session: bool = True,
-    show_session_browser: bool = True,
-    video_session_timeout_seconds: int = 45,
-    video_browser_channel: str = "chrome",
-    video_browser_executable: str | None = None,
 ) -> RenderOutputs:
     started_at = time.perf_counter()
     progress = ProgressReporter(enabled=sys.stderr.isatty())
     progress.info(f"Preparing render for game {game_id}")
     ensure_ffmpeg_available(ffmpeg_binary)
     candidates, debug_stats = build_game_manifest(
-        client,
+        browser,
         game_id,
-        max_workers=max_workers,
         cache_dir=output_dir / "cache" / "videoevents",
         max_events=max_events,
-        request_retries=request_retries,
-        retry_backoff_seconds=retry_backoff_seconds,
-        request_timeout_seconds=request_timeout_seconds,
         progress=progress,
     )
     if prune_overlap:
@@ -398,24 +366,12 @@ def render_full_game(
     available_candidates = [candidate for candidate in candidates if candidate.video_available and candidate.clip_url]
     clip_dir = output_dir / f"{game_id}_clips"
     download_started_at = time.perf_counter()
-    video_headers = load_video_headers_from_session_script(video_session_script)
-    if auto_video_session and available_candidates:
-        progress.info("Acquiring a fresh NBA browser video session...")
-        session_candidate = min(available_candidates, key=_candidate_chronology_key)
-        video_headers = acquire_video_headers_with_browser(
-            game_id=game_id,
-            event_num=session_candidate.event_num,
-            clip_url=session_candidate.clip_url or "",
-            headless=not show_session_browser,
-            timeout_seconds=video_session_timeout_seconds,
-            browser_channel=video_browser_channel,
-            browser_executable=video_browser_executable,
-        )
     clip_paths_by_event = download_available_clips(
+        browser,
         available_candidates,
         clip_dir,
         progress=progress,
-        video_headers=video_headers,
+        retries=clip_retries,
     )
     apply_clip_fingerprint_pruning(
         candidates,
@@ -463,10 +419,7 @@ def render_full_game(
         output_dir=output_dir,
         game_id=game_id,
         debug_stats=debug_stats,
-        max_workers=max_workers,
-        request_retries=request_retries,
-        retry_backoff_seconds=retry_backoff_seconds,
-        request_timeout_seconds=request_timeout_seconds,
+        clip_retries=clip_retries,
         prune_overlap=prune_overlap,
         prune_pre_buffer_seconds=prune_pre_buffer_seconds,
         prune_post_buffer_seconds=prune_post_buffer_seconds,
@@ -499,207 +452,6 @@ def resolve_ffmpeg_binary(ffmpeg_binary: str) -> str:
     raise RuntimeError(
         "ffmpeg was not found. Install ffmpeg or pass --ffmpeg-binary with the full executable path."
     )
-
-
-def load_video_headers_from_session_script(session_script: Path | None) -> dict[str, str] | None:
-    if session_script is None:
-        return None
-    if not session_script.exists():
-        raise RuntimeError(f"Video session script was not found: {session_script}")
-
-    script_text = session_script.read_text(encoding="utf-8")
-    cookies = []
-    for match in POWERSHELL_COOKIE_PATTERN.finditer(script_text):
-        name = match.group("name").replace("`\"", '"')
-        value = match.group("value").replace("`\"", '"')
-        cookies.append(f"{name}={value}")
-
-    if not cookies:
-        raise RuntimeError(
-            f"No browser cookies were found in video session script: {session_script}"
-        )
-
-    headers = dict(VIDEO_HEADERS)
-    user_agent_match = POWERSHELL_USER_AGENT_PATTERN.search(script_text)
-    if user_agent_match:
-        headers["User-Agent"] = _decode_powershell_quoted_value(user_agent_match.group("value"))
-
-    for match in POWERSHELL_HEADER_PATTERN.finditer(script_text):
-        name = match.group("name")
-        if name.lower() in {"authority", "method", "path", "scheme"}:
-            continue
-        headers[name] = _decode_powershell_quoted_value(match.group("value"))
-
-    headers["Cookie"] = "; ".join(cookies)
-    return headers
-
-
-def acquire_video_headers_with_browser(
-    game_id: str,
-    event_num: int,
-    clip_url: str,
-    headless: bool,
-    timeout_seconds: int,
-    browser_channel: str | None,
-    browser_executable: str | None = None,
-) -> dict[str, str]:
-    try:
-        from playwright.sync_api import Error as PlaywrightError
-        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:
-        raise RuntimeError(
-            "Automatic NBA video session refresh requires Playwright and an installed Chrome browser. "
-            "Run `uv sync`, install Chrome, or pass --no-auto-video-session "
-            "with --video-session-script."
-        ) from exc
-
-    event_page_url = _build_event_page_url(game_id, event_num, clip_url)
-    captured_headers: dict[str, str] | None = None
-    timeout_ms = max(timeout_seconds, 1) * 1000
-    try:
-        with sync_playwright() as playwright:
-            launch_kwargs: dict[str, object] = {"headless": headless}
-            # An explicit binary wins over a channel, and the two are mutually
-            # exclusive in Playwright. This is how the box runs Debian's own
-            # /usr/bin/chromium instead of downloading Playwright's browser
-            # bundle or adding Google's apt repository.
-            if browser_executable:
-                launch_kwargs["executable_path"] = browser_executable
-            elif browser_channel:
-                launch_kwargs["channel"] = browser_channel
-            browser = playwright.chromium.launch(**launch_kwargs)
-            context = browser.new_context()
-            page = context.new_page()
-
-            def capture_video_request(request: object) -> None:
-                nonlocal captured_headers
-                request_url = getattr(request, "url", "")
-                if captured_headers is not None:
-                    return
-                if "videos.nba.com/nba/pbp/media/" not in request_url or game_id not in request_url:
-                    return
-                try:
-                    captured_headers = dict(request.all_headers())
-                except PlaywrightError:
-                    captured_headers = dict(getattr(request, "headers", {}))
-
-            page.on("request", capture_video_request)
-            try:
-                deadline = time.perf_counter() + timeout_ms / 1000
-                try:
-                    page.goto(event_page_url, wait_until="domcontentloaded", timeout=timeout_ms)
-                except PlaywrightTimeoutError:
-                    pass
-                while captured_headers is None and time.perf_counter() < deadline:
-                    try:
-                        page.locator("video").first.evaluate(
-                            "(video) => { video.muted = true; return video.play().catch(() => undefined); }",
-                            timeout=1000,
-                        )
-                    except (PlaywrightError, PlaywrightTimeoutError):
-                        pass
-                    page.wait_for_timeout(500)
-                if captured_headers is None:
-                    try:
-                        request = page.wait_for_event(
-                            "request",
-                            predicate=lambda request: (
-                                "videos.nba.com/nba/pbp/media/" in request.url
-                                and game_id in request.url
-                            ),
-                            timeout=2000,
-                        )
-                        try:
-                            captured_headers = dict(request.all_headers())
-                        except PlaywrightError:
-                            captured_headers = dict(request.headers)
-                    except PlaywrightTimeoutError:
-                        pass
-            finally:
-                page.remove_listener("request", capture_video_request)
-                browser.close()
-    except PlaywrightTimeoutError as exc:
-        raise RuntimeError(
-            "Chromium timed out while opening the spoiler-free NBA event page for session refresh. "
-            f"Details: {exc}"
-        ) from exc
-    except PlaywrightError as exc:
-        raise RuntimeError(
-            "Could not open the browser for automatic NBA video session refresh. "
-            "Install Chrome, choose an available --video-browser-channel, or use --video-session-script. "
-            f"Details: {exc}"
-        ) from exc
-
-    if captured_headers is None:
-        raise RuntimeError(
-            "Chromium did not observe an NBA video request while refreshing the session. "
-            "Retry in visible-browser mode, or use --video-session-script."
-        )
-
-    headers = dict(VIDEO_HEADERS)
-    headers.update(
-        {
-            name: value
-            for name, value in captured_headers.items()
-            if not name.startswith(":")
-        }
-    )
-    headers["Range"] = "bytes=0-"
-    return headers
-
-
-def _build_event_page_url(game_id: str, event_num: int, clip_url: str) -> str:
-    params = {
-        "CFID": "",
-        "CFPARAMS": "",
-        "GameEventID": str(event_num),
-        "GameID": game_id,
-        "flag": "1",
-        "title": "Opening Event",
-    }
-    season = _infer_season_from_clip_url(clip_url)
-    if season:
-        params["Season"] = season
-    return f"https://www.nba.com/stats/events?{urlencode(params)}"
-
-
-def _infer_season_from_clip_url(clip_url: str) -> str | None:
-    match = re.search(r"/media/(?P<season_end_year>\d{4})/", clip_url)
-    if match is None:
-        return None
-    season_end_year = int(match.group("season_end_year"))
-    return f"{season_end_year - 1}-{str(season_end_year)[-2:]}"
-
-
-def _decode_powershell_quoted_value(value: str) -> str:
-    return value.replace("`\"", '"').replace("``", "`")
-
-
-def _download_file(url: str, destination: Path, headers: dict[str, str] | None = None) -> None:
-    request = Request(url, headers=headers or VIDEO_HEADERS)
-    try:
-        with urlopen(request, timeout=60) as response:
-            destination.write_bytes(response.read())
-    except (HTTPError, URLError) as exc:
-        raise RuntimeError(f"Failed to download clip: {url}") from exc
-
-
-def _reject_video_not_available_placeholder(clip_path: Path) -> None:
-    digest = hashlib.sha256(clip_path.read_bytes()).hexdigest()
-    if digest != KNOWN_VIDEO_NOT_AVAILABLE_SHA256:
-        return
-    raise RuntimeError(
-        "NBA returned its 'Video not available' placeholder instead of a game clip. "
-        "Automatic browser session acquisition did not produce a usable session. "
-        "Retry in visible-browser mode, or copy a fresh working video request "
-        "from Chrome DevTools as PowerShell and pass --no-auto-video-session "
-        "with --video-session-script."
-    )
-
-
-def _is_video_not_available_placeholder_error(exc: RuntimeError) -> bool:
-    return "Video not available" in str(exc)
 
 
 def _run_ffmpeg_with_progress(
@@ -765,43 +517,6 @@ def _write_cached_video_payload(cache_dir: Path | None, game_id: str, event_num:
     cache_path = cache_dir / game_id / f"{event_num:05d}.json"
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-
-def _fetch_video_event_asset_with_retry(
-    client: NbaStatsClient,
-    game_id: str,
-    event_num: int,
-    request_retries: int,
-    retry_backoff_seconds: float,
-    request_timeout_seconds: int,
-) -> dict[str, object]:
-    last_error: str | None = None
-    attempts = max(request_retries, 1)
-    for attempt in range(1, attempts + 1):
-        try:
-            payload = client.get_video_event_asset(
-                game_id,
-                event_num,
-                timeout_seconds=request_timeout_seconds,
-            )
-            if not _is_valid_video_payload(payload):
-                raise NbaStatsError(
-                    f"NBA videoeventsasset payload was empty or invalid for event {event_num}."
-                )
-            return {
-                "payload": payload,
-                "attempts": attempt,
-                "error": None,
-            }
-        except NbaStatsError as exc:
-            last_error = str(exc)
-            if attempt < attempts:
-                time.sleep(retry_backoff_seconds * attempt)
-    return {
-        "payload": None,
-        "attempts": attempts,
-        "error": last_error or "Unknown fetch error",
-    }
 
 
 def apply_overlap_pruning(
@@ -1116,10 +831,7 @@ def write_debug_report(
     output_dir: Path,
     game_id: str,
     debug_stats: FetchDebugStats,
-    max_workers: int,
-    request_retries: int,
-    retry_backoff_seconds: float,
-    request_timeout_seconds: int,
+    clip_retries: int,
     prune_overlap: bool,
     prune_pre_buffer_seconds: float,
     prune_post_buffer_seconds: float,
@@ -1158,10 +870,7 @@ def write_debug_report(
     debug_payload = {
         "game_id": game_id,
         "settings": {
-            "max_workers": max_workers,
-            "request_retries": request_retries,
-            "retry_backoff_seconds": retry_backoff_seconds,
-            "request_timeout_seconds": request_timeout_seconds,
+            "clip_retries": clip_retries,
             "prune_overlap": prune_overlap,
             "prune_pre_buffer_seconds": prune_pre_buffer_seconds,
             "prune_post_buffer_seconds": prune_post_buffer_seconds,

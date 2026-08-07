@@ -17,39 +17,38 @@ from nba_play_recap.batch import (
 from nba_play_recap.render import RenderOutputs
 
 
-class FakeClient:
-    def __init__(self, payload: dict) -> None:
-        self.payload = payload
+class FakeBrowser:
+    """Stands in for NbaBrowser: `render_night` only ever asks it for the day's cards."""
+
+    def __init__(self, cards: list[dict]) -> None:
+        self.cards = cards
         self.requested_dates: list[str] = []
 
-    def get_scoreboard_v3(self, game_date: str) -> dict:
+    def scheduled_games(self, game_date: str) -> list[dict]:
         self.requested_dates.append(game_date)
-        return self.payload
+        return self.cards
 
 
-def scoreboard_payload() -> dict:
-    return {
-        "scoreboard": {
-            "games": [
-                {
-                    "gameId": "001",
-                    "gameStatus": 3,
-                    "gameStatusText": "Final",
-                    "gameDateEst": "2026-01-02",
-                    "awayTeam": {"teamTricode": "BOS"},
-                    "homeTeam": {"teamTricode": "NYK"},
-                },
-                {
-                    "gameId": "002",
-                    "gameStatus": 2,
-                    "gameStatusText": "Q3 04:12",
-                    "gameDateEst": "2026-01-02",
-                    "awayTeam": {"teamTricode": "LAL"},
-                    "homeTeam": {"teamTricode": "GSW"},
-                },
-            ]
-        }
-    }
+def game_cards() -> list[dict]:
+    """The shape of `gameCardFeed.modules[].cards[].cardData` on www.nba.com/games."""
+    return [
+        {
+            "gameId": "001",
+            "gameStatus": 3,
+            "gameStatusText": "Final",
+            "gameTimeEastern": "2026-01-02",
+            "awayTeam": {"teamTricode": "BOS"},
+            "homeTeam": {"teamTricode": "NYK"},
+        },
+        {
+            "gameId": "002",
+            "gameStatus": 2,
+            "gameStatusText": "Q3 04:12",
+            "gameTimeEastern": "2026-01-02",
+            "awayTeam": {"teamTricode": "LAL"},
+            "homeTeam": {"teamTricode": "GSW"},
+        },
+    ]
 
 
 def fake_outputs(output_dir: Path, game_id: str) -> RenderOutputs:
@@ -79,7 +78,7 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(resolve_nba_scoreboard_date("2026-01-02"), "2026-01-02")
 
     def test_scoreboard_extraction_selects_only_completed_games(self) -> None:
-        games = extract_scoreboard_games(scoreboard_payload(), "2026-01-02")
+        games = extract_scoreboard_games(game_cards(), "2026-01-02")
 
         self.assertEqual([game.game_id for game in games], ["001", "002"])
         self.assertTrue(games[0].renderable)
@@ -88,15 +87,15 @@ class BatchTests(unittest.TestCase):
 
     def test_render_night_renders_final_games_and_writes_report(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            client = FakeClient(scoreboard_payload())
+            browser = FakeBrowser(game_cards())
             calls: list[str] = []
 
-            def renderer(_client, game_id, output_dir, _options):
+            def renderer(_browser, game_id, output_dir, _options):
                 calls.append(game_id)
                 return fake_outputs(output_dir, game_id)
 
             report = render_night(
-                client,
+                browser,
                 RenderNightOptions(target_date="2026-01-02", output_root=Path(tmpdir)),
                 renderer=renderer,
             )
@@ -116,11 +115,11 @@ class BatchTests(unittest.TestCase):
             (game_dir / "001_full_game.mp4").write_bytes(b"video")
             (game_dir / "game_status.json").write_text("{}", encoding="utf-8")
 
-            def renderer(_client, _game_id, _output_dir, _options):
+            def renderer(_browser, _game_id, _output_dir, _options):
                 raise AssertionError("renderer should not be called")
 
             report = render_night(
-                FakeClient(scoreboard_payload()),
+                FakeBrowser(game_cards()),
                 RenderNightOptions(target_date="2026-01-02", output_root=root),
                 renderer=renderer,
             )
@@ -129,18 +128,18 @@ class BatchTests(unittest.TestCase):
             self.assertEqual(report["games"][0]["skip_reason"], "already_rendered")
 
     def test_render_night_continues_after_failure_and_reports_exit_risk(self) -> None:
-        payload = scoreboard_payload()
-        payload["scoreboard"]["games"][1]["gameStatus"] = 3
-        payload["scoreboard"]["games"][1]["gameStatusText"] = "Final"
+        cards = game_cards()
+        cards[1]["gameStatus"] = 3
+        cards[1]["gameStatusText"] = "Final"
         with tempfile.TemporaryDirectory() as tmpdir:
 
-            def renderer(_client, game_id, output_dir, _options):
+            def renderer(_browser, game_id, output_dir, _options):
                 if game_id == "001":
                     raise RuntimeError("boom")
                 return fake_outputs(output_dir, game_id)
 
             report = render_night(
-                FakeClient(payload),
+                FakeBrowser(cards),
                 RenderNightOptions(target_date="2026-01-02", output_root=Path(tmpdir)),
                 renderer=renderer,
             )

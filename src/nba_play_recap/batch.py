@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-from nba_play_recap.client import NbaStatsClient
+from nba_play_recap.browser import NbaBrowser
 from nba_play_recap.render import RenderOutputs, render_full_game
 
 
@@ -42,24 +42,15 @@ class RenderNightOptions:
     dry_run: bool = False
     ffmpeg_binary: str = "ffmpeg"
     keep_clips: bool = False
-    max_workers: int = 1
     max_events: int | None = None
-    request_retries: int = 3
-    retry_backoff_seconds: float = 1.5
-    request_timeout_seconds: int = 12
+    clip_retries: int = 2
     prune_overlap: bool = True
     prune_pre_buffer_seconds: float = 2.0
     prune_post_buffer_seconds: float = 2.0
-    video_session_script: Path | None = None
-    auto_video_session: bool = True
-    show_session_browser: bool = True
-    video_session_timeout_seconds: int = 45
-    video_browser_channel: str = "chrome"
-    video_browser_executable: str | None = None
     retention_days: int = DEFAULT_RETENTION_DAYS
 
 
-Renderer = Callable[[NbaStatsClient, str, Path, RenderNightOptions], RenderOutputs]
+Renderer = Callable[[NbaBrowser, str, Path, RenderNightOptions], RenderOutputs]
 
 
 def resolve_nba_scoreboard_date(
@@ -76,13 +67,16 @@ def resolve_nba_scoreboard_date(
     return (new_york_now.date() - timedelta(days=1)).isoformat()
 
 
-def extract_scoreboard_games(payload: dict[str, Any], target_date: str) -> list[ScoreboardGame]:
-    games = payload.get("scoreboard", {}).get("games", [])
-    if not isinstance(games, list):
-        raise ValueError("scoreboard response did not contain a games list.")
+def extract_scoreboard_games(cards: list[dict[str, Any]], target_date: str) -> list[ScoreboardGame]:
+    """Turn the games page's `cardData` entries into the night's game list.
 
+    The source is `__NEXT_DATA__.props.pageProps.gameCardFeed` on
+    `www.nba.com/games?date=...` — the same server-rendered props the play-by-play comes
+    from, so the whole pipeline touches no API host (D-036). An out-of-season date
+    yields an empty list, which is the "nothing to do" case rather than a failure.
+    """
     extracted: list[ScoreboardGame] = []
-    for game in games:
+    for game in cards:
         if not isinstance(game, dict):
             continue
         game_id = str(game.get("gameId") or "")
@@ -99,7 +93,12 @@ def extract_scoreboard_games(payload: dict[str, Any], target_date: str) -> list[
         extracted.append(
             ScoreboardGame(
                 game_id=game_id,
-                game_date=str(game.get("gameDateEst") or game.get("gameDate") or target_date),
+                game_date=str(
+                    game.get("gameDateEst")
+                    or game.get("gameTimeEastern")
+                    or game.get("gameDate")
+                    or target_date
+                ),
                 away_tricode=away_tricode,
                 home_tricode=home_tricode,
                 status=status,
@@ -112,14 +111,14 @@ def extract_scoreboard_games(payload: dict[str, Any], target_date: str) -> list[
 
 
 def render_night(
-    client: NbaStatsClient,
+    browser: NbaBrowser,
     options: RenderNightOptions,
     renderer: Renderer | None = None,
 ) -> dict[str, Any]:
     started_at = datetime.now(PARIS_TZ)
     day_output_dir = options.output_root / options.target_date
-    payload = client.get_scoreboard_v3(options.target_date)
-    games = extract_scoreboard_games(payload, options.target_date)
+    cards = browser.scheduled_games(options.target_date)
+    games = extract_scoreboard_games(cards, options.target_date)
     renderer = renderer or _render_single_game
 
     report: dict[str, Any] = {
@@ -163,7 +162,7 @@ def render_night(
             continue
 
         try:
-            outputs = renderer(client, game.game_id, game_output_dir, options)
+            outputs = renderer(browser, game.game_id, game_output_dir, options)
         except Exception as exc:
             entry["status"] = "failed"
             entry["error"] = str(exc)
@@ -210,31 +209,22 @@ def prune_old_nightly_outputs(output_root: Path, target_date: str, retention_day
 
 
 def _render_single_game(
-    client: NbaStatsClient,
+    browser: NbaBrowser,
     game_id: str,
     output_dir: Path,
     options: RenderNightOptions,
 ) -> RenderOutputs:
     return render_full_game(
-        client=client,
+        browser=browser,
         game_id=game_id,
         output_dir=output_dir,
         ffmpeg_binary=options.ffmpeg_binary,
         keep_clips=options.keep_clips,
-        max_workers=options.max_workers,
         max_events=options.max_events,
-        request_retries=options.request_retries,
-        retry_backoff_seconds=options.retry_backoff_seconds,
-        request_timeout_seconds=options.request_timeout_seconds,
+        clip_retries=options.clip_retries,
         prune_overlap=options.prune_overlap,
         prune_pre_buffer_seconds=options.prune_pre_buffer_seconds,
         prune_post_buffer_seconds=options.prune_post_buffer_seconds,
-        video_session_script=options.video_session_script,
-        auto_video_session=options.auto_video_session,
-        show_session_browser=options.show_session_browser,
-        video_session_timeout_seconds=options.video_session_timeout_seconds,
-        video_browser_channel=options.video_browser_channel,
-        video_browser_executable=options.video_browser_executable,
     )
 
 
