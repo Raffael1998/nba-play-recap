@@ -370,6 +370,7 @@ def render_full_game(
     show_session_browser: bool = True,
     video_session_timeout_seconds: int = 45,
     video_browser_channel: str = "chrome",
+    video_browser_executable: str | None = None,
 ) -> RenderOutputs:
     started_at = time.perf_counter()
     progress = ProgressReporter(enabled=sys.stderr.isatty())
@@ -408,6 +409,7 @@ def render_full_game(
             headless=not show_session_browser,
             timeout_seconds=video_session_timeout_seconds,
             browser_channel=video_browser_channel,
+            browser_executable=video_browser_executable,
         )
     clip_paths_by_event = download_available_clips(
         available_candidates,
@@ -539,6 +541,7 @@ def acquire_video_headers_with_browser(
     headless: bool,
     timeout_seconds: int,
     browser_channel: str | None,
+    browser_executable: str | None = None,
 ) -> dict[str, str]:
     try:
         from playwright.sync_api import Error as PlaywrightError
@@ -557,7 +560,13 @@ def acquire_video_headers_with_browser(
     try:
         with sync_playwright() as playwright:
             launch_kwargs: dict[str, object] = {"headless": headless}
-            if browser_channel:
+            # An explicit binary wins over a channel, and the two are mutually
+            # exclusive in Playwright. This is how the box runs Debian's own
+            # /usr/bin/chromium instead of downloading Playwright's browser
+            # bundle or adding Google's apt repository.
+            if browser_executable:
+                launch_kwargs["executable_path"] = browser_executable
+            elif browser_channel:
                 launch_kwargs["channel"] = browser_channel
             browser = playwright.chromium.launch(**launch_kwargs)
             context = browser.new_context()

@@ -55,6 +55,7 @@ class RenderNightOptions:
     show_session_browser: bool = True
     video_session_timeout_seconds: int = 45
     video_browser_channel: str = "chrome"
+    video_browser_executable: str | None = None
     retention_days: int = DEFAULT_RETENTION_DAYS
 
 
@@ -233,6 +234,7 @@ def _render_single_game(
         show_session_browser=options.show_session_browser,
         video_session_timeout_seconds=options.video_session_timeout_seconds,
         video_browser_channel=options.video_browser_channel,
+        video_browser_executable=options.video_browser_executable,
     )
 
 

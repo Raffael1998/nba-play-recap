@@ -36,6 +36,9 @@ DEFAULT_HEADERS = {
     "x-nba-stats-token": "true",
 }
 
+# The Sec-Fetch-* trio is not optional: without it Akamai answers 403 for the
+# cdn.nba.com liveData endpoints. Measured 2026-08-07 by bisecting the difference
+# against DEFAULT_HEADERS, which already carried them and was never rejected.
 LIVE_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
@@ -43,6 +46,9 @@ LIVE_HEADERS = {
     "Connection": "keep-alive",
     "Pragma": "no-cache",
     "Referer": "https://www.nba.com/",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-site",
     "User-Agent": DEFAULT_HEADERS["User-Agent"],
 }
 

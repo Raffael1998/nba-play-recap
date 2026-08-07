@@ -1,126 +1,80 @@
-# Cloud VM Deployment
+# Deployment
 
-This guide targets the first public-project style deployment: reliable enough for daily use, simple to operate, and not the most expensive option.
+This project is deployed on a **personal home server**, not a rented VM, and its
+schedule is owned by that server's scheduling platform rather than by unit files kept
+here.
 
-## Recommended VM Options
+**The deployment lives in the `homeserver` repo**, not in this one:
 
-Use Ubuntu 24.04 LTS with at least 2 vCPU, 4 GB RAM, and 40-80 GB disk.
+- the job definition — schedule, timeout, retries, the exact command — is one `[[job]]`
+  block in that repo's `scripts/jobs.toml`;
+- the systemd `.service` and `.timer` are **generated** from that block by `job deploy`;
+- runs are recorded in `/srv/data/jobs/runs.jsonl` and read back with `job log`,
+  `job show` and `job status`.
 
-Good low-cost choices:
+Nothing in this repo should define a schedule, a systemd unit or a retention policy that
+competes with it. The previous version of this file did all three — it described renting
+an Ubuntu VM, installing Google Chrome from Google's apt repository, and hand-writing an
+`nba-recap-nightly@.service` — and every part of that is now wrong for how this actually
+runs.
 
-1. Hetzner CX22 or similar: best price/performance when account creation is available.
-2. Scaleway DEV1-style instance: good EU option, availability varies.
-3. OVH VPS Starter/Comfort: familiar French/EU provider, reasonable cost.
-4. DigitalOcean Basic Droplet: easiest onboarding, usually more expensive for the same resources.
+## What the program needs from its host
 
-Avoid serverless for this project. The renderer needs `ffmpeg`, Chrome, Playwright, a long-running process, and a headed-browser-compatible display through `xvfb`.
+This is the part still worth recording here, because it is a property of the program
+rather than of one deployment:
 
-## Server Setup
+| Need | Why |
+|---|---|
+| `ffmpeg` and `ffprobe` | clip concatenation and duration probing |
+| A **Chromium** binary | session acquisition; pass it with `--video-browser-executable` |
+| `xvfb` | NBA rejects true headless browsers, so Chromium must run *headed* against a virtual display, via `xvfb-run -a` |
+| `uv` | dependency resolution and the entry point |
+| A writable `HOME` | Chromium refuses to start without one, and a scheduler does not supply one by default |
 
-Install system packages:
+On Debian 13 all of `ffmpeg`, `xvfb` and `chromium` come from Debian's own repositories.
+**Prefer them over Google Chrome's `.deb`**: a browser that updates itself outside the
+host's normal patching is the last thing a scheduled job should depend on. Playwright
+drives `/usr/bin/chromium` directly through `--video-browser-executable`, which also
+avoids downloading Playwright's own browser bundle into `~/.cache/ms-playwright`.
 
-```bash
-sudo apt update
-sudo apt install -y git curl ca-certificates ffmpeg xvfb
-curl -L -o /tmp/google-chrome-stable_current_amd64.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-sudo apt install -y /tmp/google-chrome-stable_current_amd64.deb
-```
-
-Install `uv`:
-
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-Clone and install:
-
-```bash
-sudo mkdir -p /opt/nba-play-recap
-sudo chown "$USER":"$USER" /opt/nba-play-recap
-git clone <YOUR_REPO_URL> /opt/nba-play-recap/app
-cd /opt/nba-play-recap/app
-uv sync
-uv run python -m playwright install-deps chromium
-```
-
-Run a dry-run check:
+## Running one batch by hand
 
 ```bash
-cd /opt/nba-play-recap/app
-uv run nba-recap render-night --dry-run
+xvfb-run -a uv run nba-recap render-night \
+  --output-root <root> \
+  --video-browser-executable /usr/bin/chromium
 ```
 
-Run one real batch manually:
+`render-night` defaults to *yesterday in America/New_York*, which is the correct target
+for a morning run in Europe. With no games on that date it does nothing and exits 0 —
+which is also exactly what it does for the four months a year the NBA is out of season.
 
-```bash
-cd /opt/nba-play-recap/app
-xvfb-run -a uv run nba-recap render-night --output-root /opt/nba-play-recap/outputs/nightly
-```
+## Exit codes
 
-## systemd Service
+These are the contract, and the scheduling platform relies on them:
 
-Create `/etc/systemd/system/nba-recap-nightly@.service`:
+| Code | Meaning |
+|---|---|
+| `0` | nothing needs a human — including "there were no games" |
+| `1` | at least one game failed to render |
+| `2` | a hard error before per-game work began |
 
-```ini
-[Unit]
-Description=Render nightly NBA recap videos
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-User=%i
-WorkingDirectory=/opt/nba-play-recap/app
-ExecStart=/usr/bin/xvfb-run -a /home/%i/.local/bin/uv run nba-recap render-night --output-root /opt/nba-play-recap/outputs/nightly
-```
-
-Create `/etc/systemd/system/nba-recap-nightly.timer`:
-
-```ini
-[Unit]
-Description=Run NBA recap rendering every morning Paris time
-
-[Timer]
-OnCalendar=*-*-* 08:30:00 Europe/Paris
-Persistent=true
-Unit=nba-recap-nightly@YOUR_USERNAME.service
-
-[Install]
-WantedBy=timers.target
-```
-
-Enable it:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now nba-recap-nightly.timer
-```
-
-Check logs:
-
-```bash
-journalctl -u nba-recap-nightly@YOUR_USERNAME.service -n 200 --no-pager
-```
-
-## Output Layout
-
-Nightly runs write:
+## Output layout
 
 ```text
-/opt/nba-play-recap/outputs/nightly/YYYY-MM-DD/run_report.json
-/opt/nba-play-recap/outputs/nightly/YYYY-MM-DD/<GAME_ID>/<GAME_ID>_full_game.mp4
-/opt/nba-play-recap/outputs/nightly/YYYY-MM-DD/<GAME_ID>/game_status.json
+<root>/<YYYY-MM-DD>/run_report.json
+<root>/<YYYY-MM-DD>/<GAME_ID>/<GAME_ID>_full_game.mp4
+<root>/<YYYY-MM-DD>/<GAME_ID>/game_status.json
 ```
 
-The command keeps 14 days of dated output folders by default. Override with:
+`run_report.json` records what was discovered, rendered, skipped and failed. It is the
+source the scheduled job reads to report a summary, so treat its shape as a published
+interface.
 
-```bash
-uv run nba-recap render-night --retention-days 30
-```
+## Operational notes
 
-## Operational Notes
-
-- Keep rendering sequential in v1. It is slower, but friendlier to cheap VMs and NBA session acquisition.
-- Use the default headed Chrome behavior under `xvfb`; true headless mode has not been reliable against NBA.
-- Check `run_report.json` first after failures. It records skipped games, failed games, and output paths.
-- If NBA session acquisition fails repeatedly, run a manual single-game render on the VM to confirm Chrome, Playwright, and network behavior before changing code.
+- Keep rendering sequential. It is slower, but far friendlier to NBA session acquisition.
+- Use headed Chromium under `xvfb`. True headless has never been reliable against NBA.
+- Read `run_report.json` first after any failure.
+- If session acquisition fails repeatedly, render a single game by hand before changing
+  code — it is usually the browser or the network, not the pipeline.
