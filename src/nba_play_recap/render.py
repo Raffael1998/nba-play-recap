@@ -52,6 +52,7 @@ class FetchDebugStats:
     fetch_failures: int = 0
     retries: int = 0
     events_probed: int = 0
+    probe_aborted: bool = False
     video_probe_seconds: float = 0.0
     download_seconds: float = 0.0
     render_seconds: float = 0.0
@@ -64,6 +65,7 @@ def build_game_manifest(
     exclude_action_types: set[str] | None = None,
     cache_dir: Path | None = None,
     max_events: int | None = None,
+    max_consecutive_failures: int = 8,
     progress: ProgressReporter | None = None,
 ) -> tuple[list[CandidatePlay], FetchDebugStats]:
     """Read the game's play-by-play and resolve a clip URL for each candidate play.
@@ -100,8 +102,8 @@ def build_game_manifest(
         progress.start_phase("Probing clip metadata", total=len(unresolved_candidates))
 
     by_event = {candidate.event_num: candidate for candidate in unresolved_candidates}
-    payloads = browser.video_event_assets(game_id, list(by_event))
-    for event_num, payload in payloads.items():
+    consecutive_failures = 0
+    for event_num, payload in browser.iter_video_event_assets(game_id, list(by_event)):
         candidate = by_event[event_num]
         debug_stats.events_probed += 1
         if payload.get("error") or not _is_valid_video_payload(payload):
@@ -111,7 +113,24 @@ def build_game_manifest(
                 payload.get("error") or "videoeventsasset returned no usable clip URL"
             )
             debug_stats.fetch_failures += 1
+            consecutive_failures += 1
+            if consecutive_failures >= max_consecutive_failures:
+                # Stop rather than grind. This endpoint rate-limits by going SILENT —
+                # it neither refuses nor 429s, it just stops replying — so continuing
+                # means one full timeout per remaining event, which for a whole game is
+                # over an hour of hammering something that has already said no. Every
+                # answer received so far is cached, so a later run resumes from here.
+                debug_stats.probe_aborted = True
+                print(
+                    f"warning: {consecutive_failures} clip-metadata requests in a row "
+                    f"failed; stopping the probe for game {game_id} after "
+                    f"{debug_stats.events_probed}/{len(by_event)} events. "
+                    "stats.nba.com rate-limits by not answering.",
+                    file=sys.stderr,
+                )
+                break
             continue
+        consecutive_failures = 0
         _write_cached_video_payload(cache_dir, game_id, event_num, payload)
         attach_video_metadata(candidate, payload)
         if candidate.video_available:
@@ -895,6 +914,7 @@ def write_debug_report(
             "fetch_failures": debug_stats.fetch_failures,
             "retries": debug_stats.retries,
             "events_probed": debug_stats.events_probed,
+            "probe_aborted": debug_stats.probe_aborted,
         },
         "failures": failures,
         "pruned": pruned,

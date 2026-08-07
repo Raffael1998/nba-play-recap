@@ -34,7 +34,7 @@ import re
 import time
 from pathlib import Path
 from types import TracebackType
-from typing import Any
+from typing import Any, Iterator
 
 DEFAULT_CHROMIUM_PATH = "/usr/bin/chromium"
 NBA_GAMES_URL = "https://www.nba.com/games?date={game_date}"
@@ -72,13 +72,15 @@ class NbaBrowser:
         navigation_timeout_seconds: int = 90,
         request_timeout_seconds: int = 30,
         clip_timeout_seconds: int = 120,
-        asset_batch_size: int = 4,
+        asset_batch_size: int = 1,
+        asset_delay_seconds: float = 1.0,
     ) -> None:
         self.executable_path = executable_path
         self.navigation_timeout_ms = navigation_timeout_seconds * 1000
         self.request_timeout_seconds = request_timeout_seconds
         self.clip_timeout_seconds = clip_timeout_seconds
         self.asset_batch_size = max(asset_batch_size, 1)
+        self.asset_delay_seconds = max(asset_delay_seconds, 0.0)
 
         self._playwright: Any = None
         self._browser: Any = None
@@ -218,27 +220,47 @@ class NbaBrowser:
 
     # -- clip metadata ----------------------------------------------------
 
-    def video_event_assets(self, game_id: str, event_nums: list[int]) -> dict[int, dict[str, Any]]:
-        """Fetch `videoeventsasset` for many events, from inside the open page.
+    def iter_video_event_assets(
+        self, game_id: str, event_nums: list[int]
+    ) -> Iterator[tuple[int, dict[str, Any]]]:
+        """Yield `(event_num, payload)` for each event, in small batches.
 
-        Issued in small concurrent batches rather than all at once: volume is the one
-        thing that could still earn this box a real block, and nothing here is urgent.
+        **A generator on purpose.** A full game needs one call per clip — around 400 —
+        and this is the endpoint that rate-limits (see `_fetch_asset_batch`). Yielding
+        lets the caller cache each answer as it arrives, so a run that is interrupted
+        or throttled keeps everything it already paid for, and lets it stop early
+        instead of grinding through hundreds of timeouts.
 
-        A failed event is returned as `{"error": ...}` rather than raising, so one bad
-        event cannot lose a whole game.
+        A failed event is yielded as `{"error": ...}` rather than raising: one bad event
+        must not lose a whole game.
         """
-        results: dict[int, dict[str, Any]] = {}
         for start in range(0, len(event_nums), self.asset_batch_size):
             batch = event_nums[start : start + self.asset_batch_size]
-            results.update(self._fetch_asset_batch(game_id, batch))
-        return results
+            results = self._fetch_asset_batch(game_id, batch)
+            for event_num in batch:
+                yield event_num, results.get(event_num, {"error": "no response"})
+            if self.asset_delay_seconds and start + self.asset_batch_size < len(event_nums):
+                time.sleep(self.asset_delay_seconds)
+
+    def video_event_assets(self, game_id: str, event_nums: list[int]) -> dict[int, dict[str, Any]]:
+        """Eager form of `iter_video_event_assets`, for callers that want it all at once."""
+        return dict(self.iter_video_event_assets(game_id, event_nums))
 
     def _fetch_asset_batch(
         self, game_id: str, event_nums: list[int]
     ) -> dict[int, dict[str, Any]]:
-        # `credentials: 'include'` makes this fail with "TypeError: Failed to fetch" —
-        # the endpoint's CORS headers do not permit it, and the failure looks exactly
-        # like a block. Measured 2026-08-08.
+        # THIS IS THE ENDPOINT THAT RATE-LIMITS, and it is worth knowing exactly how it
+        # fails, because the failure is silent and mimics a block. Measured 2026-08-08:
+        # a fresh browser gets an answer in ~300 ms; after roughly 450 requests in a few
+        # minutes the same call HANGS INDEFINITELY — 45 s produced no response — while
+        # www.nba.com and videos.nba.com kept answering normally in ~1.2 s. It does not
+        # 429 and it does not refuse the connection; it simply stops replying. That is
+        # almost certainly what earlier sessions recorded as a "tarpit against this
+        # address": the endpoint is not hostile to the address, it is hostile to volume.
+        #
+        # `credentials: 'include'` makes this fail differently, with "TypeError: Failed
+        # to fetch" — the endpoint's CORS headers do not permit it, and that failure
+        # also looks exactly like a block.
         script = """async ([gameId, eventNums, timeoutMs]) => {
             return await Promise.all(eventNums.map(async (eventNum) => {
                 const url = `https://stats.nba.com/stats/videoeventsasset`

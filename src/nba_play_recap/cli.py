@@ -48,8 +48,22 @@ def _add_browser_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--asset-batch-size",
         type=int,
-        default=4,
-        help="How many clip-metadata requests to issue concurrently from inside the page.",
+        default=1,
+        help=(
+            "How many clip-metadata requests to issue concurrently from inside the page. "
+            "Keep this at 1 unless you have re-measured the rate limit: stats.nba.com "
+            "stops answering entirely under load, and it does not say so."
+        ),
+    )
+    parser.add_argument(
+        "--asset-delay-seconds",
+        type=float,
+        default=1.0,
+        help=(
+            "Pause between clip-metadata batches. A full game is ~420 of these requests "
+            "and the endpoint rate-limits by going silent, so this is the knob that "
+            "keeps a whole night's worth of them being answered."
+        ),
     )
     parser.add_argument(
         "--clip-timeout-seconds",
@@ -252,6 +266,7 @@ def _open_browser(args: argparse.Namespace) -> NbaBrowser:
     return NbaBrowser(
         executable_path=args.chromium_path,
         asset_batch_size=args.asset_batch_size,
+        asset_delay_seconds=args.asset_delay_seconds,
         clip_timeout_seconds=args.clip_timeout_seconds,
     )
 
