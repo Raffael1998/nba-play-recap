@@ -101,17 +101,32 @@ def build_game_manifest(
     if progress is not None:
         progress.start_phase("Probing clip metadata", total=len(unresolved_candidates))
 
-    by_event = {candidate.event_num: candidate for candidate in unresolved_candidates}
+    # SEVERAL PLAYS CAN SHARE ONE EVENT NUMBER, and they share one clip with it.
+    # Measured on 0042500402: 520 actions carry only 489 distinct `actionNumber`s, and
+    # the 31 duplicates are exactly the 31 blocks and steals — each recorded against the
+    # shot or turnover it belongs to. `actionNumber` is still the right GameEventID
+    # (`actionId` is merely a 1..n row index); the duplication is real, not an id
+    # mix-up. So group by event and ask NBA once per event, then give the answer to
+    # every play that shares it — otherwise those plays keep `video_available` from the
+    # page while having no clip URL, and the manifest claims a video that was never
+    # fetched.
+    by_event: dict[int, list[CandidatePlay]] = {}
+    for candidate in unresolved_candidates:
+        by_event.setdefault(candidate.event_num, []).append(candidate)
+
     consecutive_failures = 0
     for event_num, payload in browser.iter_video_event_assets(game_id, list(by_event)):
-        candidate = by_event[event_num]
+        siblings = by_event[event_num]
+        candidate = siblings[0]
         debug_stats.events_probed += 1
         if payload.get("error") or not _is_valid_video_payload(payload):
-            candidate.video_available = False
-            candidate.availability_status = "error"
-            candidate.availability_error = str(
+            error = str(
                 payload.get("error") or "videoeventsasset returned no usable clip URL"
             )
+            for sibling in siblings:
+                sibling.video_available = False
+                sibling.availability_status = "error"
+                sibling.availability_error = error
             debug_stats.fetch_failures += 1
             consecutive_failures += 1
             if consecutive_failures >= max_consecutive_failures:
@@ -132,7 +147,8 @@ def build_game_manifest(
             continue
         consecutive_failures = 0
         _write_cached_video_payload(cache_dir, game_id, event_num, payload)
-        attach_video_metadata(candidate, payload)
+        for sibling in siblings:
+            attach_video_metadata(sibling, payload)
         if candidate.video_available:
             debug_stats.fetch_successes += 1
         else:
@@ -403,11 +419,19 @@ def render_full_game(
     debug_stats.download_seconds = round(time.perf_counter() - download_started_at, 3)
     manifest_txt_path, manifest_json_path = write_manifests(candidates, output_dir, game_id)
     rendered_candidates = [candidate for candidate in available_candidates if candidate.included_in_render]
-    clip_paths = [
-        clip_paths_by_event[candidate.event_num]
-        for candidate in sorted(rendered_candidates, key=_candidate_chronology_key)
-        if candidate.event_num in clip_paths_by_event
-    ]
+    # One clip per event, even when several plays share the event. A block and the shot
+    # it blocked are two rows of the timeline and one video; without this guard the same
+    # file is concatenated twice and the recap stutters.
+    clip_paths: list[Path] = []
+    seen_events: set[int] = set()
+    for candidate in sorted(rendered_candidates, key=_candidate_chronology_key):
+        if candidate.event_num in seen_events:
+            continue
+        clip_path = clip_paths_by_event.get(candidate.event_num)
+        if clip_path is None:
+            continue
+        seen_events.add(candidate.event_num)
+        clip_paths.append(clip_path)
     concat_list_path = write_concat_list(clip_paths, output_dir, game_id)
 
     video_path: Path | None = None
